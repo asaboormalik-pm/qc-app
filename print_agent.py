@@ -22,6 +22,8 @@ import requests
 class Config:
     supabase_url: str
     supabase_key: str
+    print_agent_callback_url: str
+    print_agent_api_key: str
     poll_interval_seconds: float = 2.0
     printer_port: int = 9100
     printer_timeout_seconds: float = 5.0
@@ -36,6 +38,10 @@ class PrintAgent:
             "Authorization": f"Bearer {config.supabase_key}",
             "Content-Type": "application/json",
             "Prefer": "return=representation",
+        }
+        self.callback_headers = {
+            "X-API-Key": config.print_agent_api_key,
+            "Content-Type": "application/json",
         }
 
     def run_forever(self) -> None:
@@ -100,6 +106,29 @@ class PrintAgent:
             sock.sendall(zpl.encode("utf-8"))
 
     def _mark_done(self, job_id: str) -> None:
+        self._notify_print_service(job_id=job_id, status="completed", error_message=None)
+
+    def _mark_failed(self, job_id: str, error_message: str) -> None:
+        self._notify_print_service(
+            job_id=job_id,
+            status="failed",
+            error_message=error_message[:500],
+        )
+
+    def _notify_print_service(
+        self,
+        job_id: str,
+        status: str,
+        error_message: Optional[str],
+    ) -> None:
+        payload = {
+            "jobId": job_id,
+            "status": status,
+            "errorMessage": error_message,
+        }
+        response = requests.post(
+            self.config.print_agent_callback_url,
+            headers=self.callback_headers,
         self._update_job(job_id, {"status": "completed", "error": None})
 
     def _mark_failed(self, job_id: str, error_message: str) -> None:
@@ -157,10 +186,14 @@ def load_config() -> Config:
 
     supabase_url = os.environ["SUPABASE_URL"]
     supabase_key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    print_agent_callback_url = os.environ["PRINT_AGENT_CALLBACK_URL"]
+    print_agent_api_key = os.environ["PRINT_AGENT_API_KEY"]
 
     return Config(
         supabase_url=supabase_url,
         supabase_key=supabase_key,
+        print_agent_callback_url=print_agent_callback_url,
+        print_agent_api_key=print_agent_api_key,
         poll_interval_seconds=float(os.getenv("POLL_INTERVAL_SECONDS", "2")),
         printer_port=int(os.getenv("PRINTER_PORT", "9100")),
         printer_timeout_seconds=float(os.getenv("PRINTER_TIMEOUT_SECONDS", "5")),

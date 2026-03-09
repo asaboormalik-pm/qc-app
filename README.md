@@ -8,6 +8,8 @@ Do **not** hardcode these in source code. Configure them during deployment throu
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
+- `PRINT_AGENT_CALLBACK_URL`
+- `PRINT_AGENT_API_KEY`
 
 This keeps credentials out of git and lets you promote the same code across dev/staging/prod.
 
@@ -15,6 +17,8 @@ This keeps credentials out of git and lets you promote the same code across dev/
 
 - `SUPABASE_URL` (required)
 - `SUPABASE_SERVICE_ROLE_KEY` (required)
+- `PRINT_AGENT_CALLBACK_URL` (required) — e.g. `https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent`
+- `PRINT_AGENT_API_KEY` (required)
 - `POLL_INTERVAL_SECONDS` (optional, default: `2`)
 - `PRINTER_PORT` (optional, default: `9100`)
 - `PRINTER_TIMEOUT_SECONDS` (optional, default: `5`)
@@ -28,6 +32,7 @@ Use this section as a runbook for deploying in the warehouse network.
 
 - Use an always-on machine in the same network segment that can reach:
   - Your cloud Supabase/PostgREST endpoint over HTTPS (443)
+  - The callback endpoint over HTTPS (443)
   - All label printers over TCP 9100
 - Recommended: Linux VM/server (Ubuntu 22.04+).
 - Ensure Python 3.10+ is installed.
@@ -56,6 +61,11 @@ sudo -u qcprint /opt/qc-print-agent/.venv/bin/pip install requests
 Create `/opt/qc-print-agent/.env`:
 
 ```bash
+sudo -u qcprint tee /opt/qc-print-agent/.env >/dev/null <<'EOF_ENV'
+SUPABASE_URL=https://<project>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
+PRINT_AGENT_CALLBACK_URL=https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent
+PRINT_AGENT_API_KEY=<print-agent-api-key>
 sudo -u qcprint tee /opt/qc-print-agent/.env >/dev/null <<'EOF'
 SUPABASE_URL=https://<project>.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
@@ -63,6 +73,7 @@ POLL_INTERVAL_SECONDS=2
 PRINTER_PORT=9100
 PRINTER_TIMEOUT_SECONDS=5
 LOG_LEVEL=INFO
+EOF_ENV
 EOF
 ```
 
@@ -82,6 +93,7 @@ From the host, verify:
 ```bash
 # Cloud connectivity
 curl -I https://<project>.supabase.co
+curl -I https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent
 
 # Printer reachability (repeat for each printer IP)
 nc -vz <printer_ip> 9100
@@ -99,6 +111,8 @@ sudo -u qcprint env -i HOME=/home/qcprint PATH=/usr/bin:/bin \
 
 Expected behavior:
 - Agent starts and waits.
+- When a `pending` job is inserted, it moves to `processing` then callback is sent with `status=completed`.
+- On failure callback is sent with `status=failed` and `errorMessage`.
 - When a `pending` job is inserted, it moves to `processing` then `completed`.
 - On failure it moves to `failed` with `error` populated.
 
@@ -172,6 +186,33 @@ pip install requests
 
 export SUPABASE_URL="https://<project>.supabase.co"
 export SUPABASE_SERVICE_ROLE_KEY="<service-role-key>"
+export PRINT_AGENT_CALLBACK_URL="https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent"
+export PRINT_AGENT_API_KEY="<print-agent-api-key>"
+python3 print_agent.py
+```
+
+## Expected callback payload schema
+
+When a job is completed/failed, the agent posts:
+
+```json
+{
+  "jobId": "uuid-of-the-print-job",
+  "status": "completed",
+  "errorMessage": null
+}
+```
+
+- `jobId`: required UUID from poll response
+- `status`: required, one of `completed`, `failed`, `pending`
+- `errorMessage`: optional (set when `status=failed`, otherwise `null`)
+
+## Expected `print_jobs` fields
+
+The sample agent expects the following fields for polling/claiming:
+
+- `id`
+- `status` (`pending` -> `processing`)
 python3 print_agent.py
 ```
 
