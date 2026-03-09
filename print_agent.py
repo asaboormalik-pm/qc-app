@@ -129,6 +129,17 @@ class PrintAgent:
         response = requests.post(
             self.config.print_agent_callback_url,
             headers=self.callback_headers,
+        self._update_job(job_id, {"status": "completed", "error": None})
+
+    def _mark_failed(self, job_id: str, error_message: str) -> None:
+        self._update_job(job_id, {"status": "failed", "error": error_message[:500]})
+
+    def _update_job(self, job_id: str, payload: Dict[str, Any]) -> None:
+        params = {"id": f"eq.{job_id}", "select": "id"}
+        response = requests.patch(
+            f"{self.base_url}/print_jobs",
+            headers=self.headers,
+            params=params,
             json=payload,
             timeout=10,
         )

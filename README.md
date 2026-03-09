@@ -66,11 +66,15 @@ SUPABASE_URL=https://<project>.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
 PRINT_AGENT_CALLBACK_URL=https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent
 PRINT_AGENT_API_KEY=<print-agent-api-key>
+sudo -u qcprint tee /opt/qc-print-agent/.env >/dev/null <<'EOF'
+SUPABASE_URL=https://<project>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
 POLL_INTERVAL_SECONDS=2
 PRINTER_PORT=9100
 PRINTER_TIMEOUT_SECONDS=5
 LOG_LEVEL=INFO
 EOF_ENV
+EOF
 ```
 
 Security recommendations:
@@ -109,6 +113,8 @@ Expected behavior:
 - Agent starts and waits.
 - When a `pending` job is inserted, it moves to `processing` then callback is sent with `status=completed`.
 - On failure callback is sent with `status=failed` and `errorMessage`.
+- When a `pending` job is inserted, it moves to `processing` then `completed`.
+- On failure it moves to `failed` with `error` populated.
 
 Stop with `Ctrl+C` after validation.
 
@@ -207,7 +213,19 @@ The sample agent expects the following fields for polling/claiming:
 
 - `id`
 - `status` (`pending` -> `processing`)
+python3 print_agent.py
+```
+
+## Expected `print_jobs` fields
+
+The sample agent expects the following fields:
+
+- `id`
+- `status` (`pending` -> `processing` -> `completed|failed`)
 - `zpl`
 - `printer_ip`
 - `created_at`
 - `processing_started_at` (optional but recommended)
+- `error` (optional but recommended)
+
+Adjust the query/payload in `print_agent.py` if your schema differs.
