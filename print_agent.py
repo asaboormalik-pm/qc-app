@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """On-prem print agent for Zebra/compatible network printers.
 
-This agent polls `print_jobs` from Supabase/PostgREST, sends ZPL to printers via
-raw TCP 9100, and marks jobs as completed/failed.
+This agent polls an edge function for print jobs, sends ZPL to printers via raw
+TCP 9100, and posts completion or failure back to the same edge function.
 """
 
 from __future__ import annotations
@@ -12,17 +12,17 @@ import os
 import socket
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
 
+DEFAULT_HTTP_TIMEOUT_SECONDS = 10
+
+
 @dataclass
 class Config:
-    supabase_url: str
-    supabase_key: str
-    print_agent_callback_url: str
+    print_agent_url: str
     print_agent_api_key: str
     poll_interval_seconds: float = 2.0
     printer_port: int = 9100
@@ -32,14 +32,7 @@ class Config:
 class PrintAgent:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.base_url = f"{config.supabase_url.rstrip('/')}/rest/v1"
         self.headers = {
-            "apikey": config.supabase_key,
-            "Authorization": f"Bearer {config.supabase_key}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation",
-        }
-        self.callback_headers = {
             "X-API-Key": config.print_agent_api_key,
             "Content-Type": "application/json",
         }
@@ -56,42 +49,22 @@ class PrintAgent:
                 time.sleep(self.config.poll_interval_seconds)
 
     def _fetch_pending_job(self) -> Optional[Dict[str, Any]]:
-        params = {
-            "select": "id,zpl,printer_ip,status,created_at",
-            "status": "eq.pending",
-            "order": "created_at.asc",
-            "limit": "1",
-        }
         response = requests.get(
-            f"{self.base_url}/print_jobs",
+            self.config.print_agent_url,
             headers=self.headers,
-            params=params,
-            timeout=10,
+            params={"action": "poll", "limit": "1"},
+            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        rows = response.json()
-        return rows[0] if rows else None
-
-    def _claim_job(self, job_id: str) -> bool:
-        params = {
-            "id": f"eq.{job_id}",
-            "status": "eq.pending",
-            "select": "id",
-        }
-        payload = {
-            "status": "processing",
-            "processing_started_at": datetime.now(timezone.utc).isoformat(),
-        }
-        response = requests.patch(
-            f"{self.base_url}/print_jobs",
-            headers=self.headers,
-            params=params,
-            json=payload,
-            timeout=10,
-        )
-        response.raise_for_status()
-        claimed_rows = response.json()
-        return len(claimed_rows) == 1
+        body = response.json()
+        jobs: List[Dict[str, Any]]
+        if isinstance(body, dict):
+            jobs = body.get("jobs") or []
+        elif isinstance(body, list):
+            jobs = body
+        else:
+            raise ValueError("Unexpected poll response format from print agent endpoint")
+        return jobs[0] if jobs else None
 
     def _send_to_printer(self, job: Dict[str, Any]) -> None:
         printer_ip = job.get("printer_ip")
@@ -127,21 +100,10 @@ class PrintAgent:
             "errorMessage": error_message,
         }
         response = requests.post(
-            self.config.print_agent_callback_url,
-            headers=self.callback_headers,
-        self._update_job(job_id, {"status": "completed", "error": None})
-
-    def _mark_failed(self, job_id: str, error_message: str) -> None:
-        self._update_job(job_id, {"status": "failed", "error": error_message[:500]})
-
-    def _update_job(self, job_id: str, payload: Dict[str, Any]) -> None:
-        params = {"id": f"eq.{job_id}", "select": "id"}
-        response = requests.patch(
-            f"{self.base_url}/print_jobs",
+            self.config.print_agent_url,
             headers=self.headers,
-            params=params,
             json=payload,
-            timeout=10,
+            timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
 
@@ -152,19 +114,25 @@ class PrintAgent:
             return False
 
         job_id = job["id"]
-        if not self._claim_job(job_id):
-            return False
-
-        logging.info("processing job=%s", job_id)
+        logging.info("processing job=%s printer_ip=%s", job_id, job.get("printer_ip"))
         try:
             self._send_to_printer(job)
         except Exception as exc:
             self._mark_failed(job_id, str(exc))
             raise
-        else:
+
+        try:
             self._mark_done(job_id)
-            logging.info("completed job=%s", job_id)
-            return True
+        except Exception as exc:
+            logging.error(
+                "completion callback failed after successful print job=%s error=%s",
+                job_id,
+                exc,
+            )
+            raise
+
+        logging.info("completed job=%s", job_id)
+        return True
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -181,19 +149,19 @@ def load_dotenv(path: str = ".env") -> None:
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
 def load_config() -> Config:
     load_dotenv()
 
-    supabase_url = os.environ["SUPABASE_URL"]
-    supabase_key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-    print_agent_callback_url = os.environ["PRINT_AGENT_CALLBACK_URL"]
-    print_agent_api_key = os.environ["PRINT_AGENT_API_KEY"]
-
     return Config(
-        supabase_url=supabase_url,
-        supabase_key=supabase_key,
-        print_agent_callback_url=print_agent_callback_url,
-        print_agent_api_key=print_agent_api_key,
+        print_agent_url=require_env("PRINT_AGENT_CALLBACK_URL"),
+        print_agent_api_key=require_env("PRINT_AGENT_API_KEY"),
         poll_interval_seconds=float(os.getenv("POLL_INTERVAL_SECONDS", "2")),
         printer_port=int(os.getenv("PRINTER_PORT", "9100")),
         printer_timeout_seconds=float(os.getenv("PRINTER_TIMEOUT_SECONDS", "5")),
@@ -202,7 +170,7 @@ def load_config() -> Config:
 
 def main() -> None:
     logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(message)s",
     )
     agent = PrintAgent(load_config())
