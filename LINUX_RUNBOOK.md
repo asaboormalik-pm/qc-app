@@ -1,6 +1,15 @@
-# Linux Smoke Test Runbook
+# Linux/macOS Smoke Test Runbook
 
-Use this on a Russia-side Linux machine or VM during the live validation call.
+Use this on a Linux machine/VM or macOS Terminal during the live validation call.
+
+## 0. Clone the repository
+
+```bash
+git clone <REPO_URL>
+cd qc-app
+```
+
+Replace `<REPO_URL>` and folder name if needed.
 
 ## 1. Prepare the folder
 
@@ -15,6 +24,14 @@ Put these files in one folder:
 
 ```bash
 python3 --version
+```
+
+Required: Python 3.10+.
+
+macOS only (if Python is missing):
+
+```bash
+brew install python
 ```
 
 ## 3. Create a virtual environment and install dependency
