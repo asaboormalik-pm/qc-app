@@ -11,6 +11,7 @@ import logging
 import os
 import socket
 import time
+import pprint
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -68,15 +69,34 @@ class PrintAgent:
 
     def _send_to_printer(self, job: Dict[str, Any]) -> None:
         printer_ip = job.get("printer_ip")
-        zpl = job.get("zpl")
+        printer_port = int(job.get("printer_port", self.config.printer_port))
+        zpl = job.get("zpl_data")
         if not printer_ip or not zpl:
             raise ValueError("job missing printer_ip or zpl")
+        # logging.info("zpl_data job payload:\n%s", zpl)
 
-        with socket.create_connection(
-            (printer_ip, self.config.printer_port),
-            timeout=self.config.printer_timeout_seconds,
-        ) as sock:
-            sock.sendall(zpl.encode("utf-8"))
+        # with socket.create_connection(
+        #     (printer_ip, self.config.printer_port),
+        #     timeout=self.config.printer_timeout_seconds,
+        # ) as sock:
+        #     sock.sendall(zpl.encode("utf-8"))
+
+        try:
+            # Create socket connection
+            mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            mysocket.settimeout(self.config.printer_timeout_seconds)
+            print(printer_port)
+            mysocket.connect( (printer_ip, printer_port) )
+            
+
+        
+            # Send ZPL command
+            mysocket.sendall(zpl.encode())
+            mysocket.close()
+            print("Label sent to printer")
+        except Exception as e:
+            print(f"Error: {e}")
+            raise e
 
     def _mark_done(self, job_id: str) -> None:
         self._notify_print_service(job_id=job_id, status="completed", error_message=None)
@@ -114,7 +134,7 @@ class PrintAgent:
             return False
 
         job_id = job["id"]
-        logging.info("processing job=%s printer_ip=%s", job_id, job.get("printer_ip"))
+        logging.info("processing job=%s printer_ip=%s printer_port=%s", job_id, job.get("printer_ip"), job.get("printer_port"))
         try:
             self._send_to_printer(job)
         except Exception as exc:
@@ -146,8 +166,11 @@ def load_dotenv(path: str = ".env") -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+            print(f"Loading env var from .env: {key.strip()}={value.strip()}")
+            # os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+            os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
+# https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent
 
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -158,14 +181,18 @@ def require_env(name: str) -> str:
 
 def load_config() -> Config:
     load_dotenv()
-
-    return Config(
+    config = Config(
         print_agent_url=require_env("PRINT_AGENT_CALLBACK_URL"),
         print_agent_api_key=require_env("PRINT_AGENT_API_KEY"),
         poll_interval_seconds=float(os.getenv("POLL_INTERVAL_SECONDS", "2")),
         printer_port=int(os.getenv("PRINTER_PORT", "9100")),
-        printer_timeout_seconds=float(os.getenv("PRINTER_TIMEOUT_SECONDS", "5")),
+        printer_timeout_seconds=int(os.getenv("PRINTER_TIMEOUT_SECONDS", "30000")),
     )
+    pprint.pprint(config)
+    return config
+
+
+     
 
 
 def main() -> None:
