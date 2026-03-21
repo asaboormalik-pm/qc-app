@@ -1,5 +1,13 @@
+# Environment variables
 .env
 .env.local
+
+# Python
 .venv/
 __pycache__/
 *.py[cod]
+
+# Print agent runtime files
+print_agent.pid
+print_agent.log
+*.log
