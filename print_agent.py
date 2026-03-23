@@ -112,7 +112,7 @@ class PrintAgent:
                                                 job.get("id"), exc)
                                 # Mark job as failed in backend
                                 try:
-                                    self._mark_failed(job.get("id"), str(exc))
+                                    self._mark_failed(job, str(exc))
                                 except Exception as callback_exc:
                                     logging.error("Failed to mark job %s as failed: %s",
                                                  job.get("id"), callback_exc)
@@ -241,26 +241,167 @@ class PrintAgent:
         except OSError as e:
             raise Exception(f"Network error communicating with printer {printer_ip}:{printer_port}: {e}")
 
-    def _mark_done(self, job_id: str) -> None:
-        self._notify_print_service(job_id=job_id, status="completed", error_message=None)
+    def _sanitize_payload_text(self, value: Any, max_length: int = 2000) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value)
+        lowered = text.lower()
+        for marker in ("authorization:", "api-key", "x-api-key", "token", "bearer "):
+            if marker in lowered:
+                return "[redacted]"
+        if len(text) > max_length:
+            return f"{text[:max_length]}... [truncated]"
+        return text
 
-    def _mark_failed(self, job_id: str, error_message: str) -> None:
+    def _parse_optional_int(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_job_field(self, job: Dict[str, Any], *keys: str) -> Any:
+        metadata = job.get("metadata")
+        for key in keys:
+            if key in job and job.get(key) is not None:
+                return job.get(key)
+            if isinstance(metadata, dict) and key in metadata and metadata.get(key) is not None:
+                return metadata.get(key)
+        return None
+
+    def _extract_job_context(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "channel": self._extract_job_field(job, "channel") or "print",
+            "attempt": self._parse_optional_int(self._extract_job_field(job, "attempt")),
+            "max_attempts": self._parse_optional_int(
+                self._extract_job_field(job, "maxAttempts", "max_attempts")
+            ),
+            "endpoint_key": self._extract_job_field(job, "endpointKey", "endpoint_key"),
+            "business_type": self._extract_job_field(job, "businessType", "business_type"),
+            "business_id": self._extract_job_field(job, "businessId", "business_id"),
+            "correlation_id": self._extract_job_field(job, "correlationId", "correlation_id"),
+            "erp_body": self._extract_job_field(
+                job,
+                "erpBody",
+                "erp_body",
+                "erpResponseBody",
+                "erp_response_body",
+                "responseBody",
+                "response_body",
+            ),
+        }
+
+    def _prepare_erp_body(self, erp_body: Any) -> Any:
+        if erp_body is None:
+            return None
+        if isinstance(erp_body, (dict, list)):
+            return erp_body
+        return self._sanitize_payload_text(erp_body)
+
+    def _classify_error(self, error_message: str) -> str:
+        lowered = error_message.lower()
+        if "timeout" in lowered:
+            return "printer_timeout"
+        if "refused" in lowered:
+            return "connection_refused"
+        if "missing valid" in lowered or "out of valid range" in lowered or "empty" in lowered:
+            return "invalid_job_payload"
+        return "printer_transport_error"
+
+    def _failure_status_for_attempt(self, attempt: Optional[int], max_attempts: Optional[int]) -> str:
+        if attempt is not None and max_attempts is not None and attempt < max_attempts:
+            return "retry_scheduled"
+        return "failed"
+
+    def _mark_done(self, job: Dict[str, Any], duration_ms: Optional[int] = None) -> None:
+        context = self._extract_job_context(job)
         self._notify_print_service(
-            job_id=job_id,
-            status="failed",
-            error_message=(error_message[:500] if error_message else None),
+            job_id=job.get("id"),
+            status="completed",
+            error_message=None,
+            channel=context["channel"],
+            attempt=context["attempt"],
+            max_attempts=context["max_attempts"],
+            endpoint_key=context["endpoint_key"],
+            business_type=context["business_type"],
+            business_id=context["business_id"],
+            correlation_id=context["correlation_id"],
+            response_code=200,
+            retryable=False,
+            error_code=None,
+            transport_error_message=None,
+            duration_ms=duration_ms,
+            erp_body=context["erp_body"],
+        )
+
+    def _mark_failed(self, job: Dict[str, Any], error_message: str, duration_ms: Optional[int] = None) -> None:
+        context = self._extract_job_context(job)
+        attempt = context["attempt"]
+        max_attempts = context["max_attempts"]
+        status = self._failure_status_for_attempt(attempt, max_attempts)
+        sanitized_error = self._sanitize_payload_text(error_message, max_length=500)
+        retryable = status == "retry_scheduled"
+        self._notify_print_service(
+            job_id=job.get("id"),
+            status=status,
+            error_message=sanitized_error,
+            channel=context["channel"],
+            attempt=attempt,
+            max_attempts=max_attempts,
+            endpoint_key=context["endpoint_key"],
+            business_type=context["business_type"],
+            business_id=context["business_id"],
+            correlation_id=context["correlation_id"],
+            response_code=429 if retryable else 500,
+            retryable=retryable,
+            error_code=self._classify_error(error_message),
+            transport_error_message=sanitized_error,
+            duration_ms=duration_ms,
+            erp_body=context["erp_body"],
         )
 
     def _notify_print_service(
         self,
-        job_id: str,
+        job_id: Optional[str],
         status: str,
         error_message: Optional[str],
+        channel: Optional[str] = None,
+        attempt: Optional[int] = None,
+        max_attempts: Optional[int] = None,
+        endpoint_key: Optional[str] = None,
+        business_type: Optional[str] = None,
+        business_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        response_code: Optional[int] = None,
+        retryable: Optional[bool] = None,
+        error_code: Optional[str] = None,
+        transport_error_message: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        erp_body: Any = None,
     ) -> None:
         payload = {
+            # Compatibility fields
             "jobId": job_id,
             "status": status,
             "errorMessage": error_message,
+            # Extended callback context
+            "channel": channel,
+            "attempt": attempt,
+            "maxAttempts": max_attempts,
+            "endpointKey": endpoint_key,
+            "businessType": business_type,
+            "businessId": business_id,
+            "correlationId": correlation_id,
+            # Transport result fields
+            "responseCode": response_code,
+            "retryable": retryable,
+            "errorCode": error_code,
+            "durationMs": duration_ms,
+            # Keep both compatibility and transport-level error detail
+            "transportErrorMessage": transport_error_message,
+            # Parsed ERP response body (truncated/redacted as needed)
+            "erpBody": self._prepare_erp_body(erp_body),
         }
         try:
             response = requests.post(
@@ -288,15 +429,18 @@ class PrintAgent:
         thread_id = threading.current_thread().name
         logging.info("[%s] processing job=%s printer_ip=%s printer_port=%s",
                      thread_id, job_id, job.get("printer_ip"), job.get("printer_port"))
+        started_at = time.monotonic()
         try:
             self._send_to_printer(job)
         except Exception as exc:
-            self._mark_failed(job_id, str(exc))
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            self._mark_failed(job, str(exc), duration_ms=duration_ms)
             logging.error("[%s] failed job=%s error=%s", thread_id, job_id, exc)
             return False
 
+        duration_ms = int((time.monotonic() - started_at) * 1000)
         try:
-            self._mark_done(job_id)
+            self._mark_done(job, duration_ms=duration_ms)
         except Exception as exc:
             logging.error(
                 "[%s] completion callback failed after successful print job=%s error=%s",
@@ -596,5 +740,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
