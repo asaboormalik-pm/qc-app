@@ -15,7 +15,9 @@ import time
 import pprint
 import threading
 import atexit
-from dataclasses import dataclass
+import json
+import base64
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import signal as signal_module
@@ -35,6 +37,13 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 
 
 @dataclass
+class ErpEndpointConfig:
+    url: str
+    method: str = "POST"
+    timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS
+
+
+@dataclass
 class Config:
     print_agent_url: str
     print_agent_api_key: str
@@ -43,6 +52,16 @@ class Config:
     printer_timeout_seconds: float = 5.0
     max_concurrent_jobs: int = 3  # Support 2-3 printers per station
     workstation_id: str = ""  # Unique identifier for this workstation (for tracking)
+    erp_enabled: bool = False
+    erp_endpoints: Dict[str, ErpEndpointConfig] = field(default_factory=dict)
+    erp_auth_mode: str = "none"
+    erp_auth_bearer_token: Optional[str] = None
+    erp_auth_basic_username: Optional[str] = None
+    erp_auth_basic_password: Optional[str] = None
+    erp_auth_static_headers: Dict[str, str] = field(default_factory=dict)
+    erp_retry_attempts: int = 0
+    erp_retry_backoff_seconds: float = 1.0
+    erp_default_timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS
 
 
 class PrintAgent:
@@ -57,6 +76,94 @@ class PrintAgent:
 
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
+
+    def _is_erp_job(self, job: Dict[str, Any]) -> bool:
+        job_type = str(job.get("job_type", "")).strip().lower()
+        channel = str(job.get("channel", "")).strip().lower()
+        return (
+            job_type == "erp"
+            or channel == "erp"
+            or "erp_endpoint_key" in job
+            or "endpoint_key" in job
+            or "endpointKey" in job
+        )
+
+    def _extract_erp_endpoint_key(self, job: Dict[str, Any]) -> str:
+        raw = (
+            job.get("erp_endpoint_key")
+            or job.get("endpoint_key")
+            or job.get("endpointKey")
+            or ""
+        )
+        endpoint_key = str(raw).strip()
+        if not endpoint_key:
+            raise ValueError("ERP job missing required endpoint key")
+        if endpoint_key not in (self.config.erp_endpoints or {}):
+            raise ValueError(
+                f"ERP endpoint key '{endpoint_key}' is not configured on this workstation"
+            )
+        return endpoint_key
+
+    def _build_erp_headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+            "X-Workstation-Id": self.config.workstation_id,
+        }
+
+        if self.config.erp_auth_mode == "bearer":
+            headers["Authorization"] = f"Bearer {self.config.erp_auth_bearer_token}"
+        elif self.config.erp_auth_mode == "basic":
+            username = self.config.erp_auth_basic_username or ""
+            password = self.config.erp_auth_basic_password or ""
+            credentials = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+            headers["Authorization"] = f"Basic {credentials}"
+        elif self.config.erp_auth_mode == "static_headers":
+            headers.update(self.config.erp_auth_static_headers or {})
+
+        return headers
+
+    def _send_to_erp(self, job: Dict[str, Any]) -> None:
+        if not self.config.erp_enabled:
+            raise ValueError("ERP job received but ERP_ENABLED is false")
+
+        endpoint_key = self._extract_erp_endpoint_key(job)
+        endpoint = (self.config.erp_endpoints or {})[endpoint_key]
+        headers = self._build_erp_headers()
+
+        # Never trust ERP URL/auth in cloud payload; only local endpoint config is used.
+        payload = job.get("erp_payload")
+        if payload is None:
+            payload = job.get("payload")
+
+        attempts = self.config.erp_retry_attempts + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.request(
+                    method=endpoint.method,
+                    url=endpoint.url,
+                    headers=headers,
+                    json=payload if isinstance(payload, (dict, list)) else {"payload": payload},
+                    timeout=endpoint.timeout_seconds,
+                )
+                response.raise_for_status()
+                logging.info("ERP request sent for job=%s endpoint=%s", job.get("id"), endpoint_key)
+                return
+            except requests.RequestException as exc:
+                if attempt >= attempts:
+                    raise Exception(
+                        f"ERP request failed after {attempts} attempt(s): {exc}"
+                    ) from exc
+                sleep_seconds = self.config.erp_retry_backoff_seconds * attempt
+                logging.warning(
+                    "ERP request failed for job=%s endpoint=%s attempt=%d/%d; retrying in %.2fs: %s",
+                    job.get("id"),
+                    endpoint_key,
+                    attempt,
+                    attempts,
+                    sleep_seconds,
+                    exc,
+                )
+                time.sleep(sleep_seconds)
 
     def _setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
@@ -289,7 +396,10 @@ class PrintAgent:
         logging.info("[%s] processing job=%s printer_ip=%s printer_port=%s",
                      thread_id, job_id, job.get("printer_ip"), job.get("printer_port"))
         try:
-            self._send_to_printer(job)
+            if self._is_erp_job(job):
+                self._send_to_erp(job)
+            else:
+                self._send_to_printer(job)
         except Exception as exc:
             self._mark_failed(job_id, str(exc))
             logging.error("[%s] failed job=%s error=%s", thread_id, job_id, exc)
@@ -348,6 +458,65 @@ def require_env(name: str) -> str:
     return value
 
 
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value (true/false), got: {value}")
+
+
+def parse_erp_endpoints(raw_json: str, default_timeout_seconds: float) -> Dict[str, ErpEndpointConfig]:
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"ERP_ENDPOINTS_JSON must be valid JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("ERP_ENDPOINTS_JSON must be a JSON object keyed by endpoint key")
+
+    endpoints: Dict[str, ErpEndpointConfig] = {}
+    for endpoint_key, endpoint_value in parsed.items():
+        if not isinstance(endpoint_key, str) or not endpoint_key.strip():
+            raise ValueError("ERP_ENDPOINTS_JSON endpoint keys must be non-empty strings")
+        if not isinstance(endpoint_value, dict):
+            raise ValueError(f"ERP endpoint '{endpoint_key}' must be an object")
+
+        url = str(endpoint_value.get("url", "")).strip()
+        if not url:
+            raise ValueError(f"ERP endpoint '{endpoint_key}' is missing required 'url'")
+
+        method = str(endpoint_value.get("method", "POST")).strip().upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise ValueError(
+                f"ERP endpoint '{endpoint_key}' has unsupported method '{method}'"
+            )
+
+        timeout_raw = endpoint_value.get("timeout_seconds", default_timeout_seconds)
+        try:
+            timeout_seconds = float(timeout_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"ERP endpoint '{endpoint_key}' timeout_seconds must be numeric, got: {timeout_raw}"
+            ) from exc
+        if timeout_seconds <= 0:
+            raise ValueError(
+                f"ERP endpoint '{endpoint_key}' timeout_seconds must be > 0, got: {timeout_seconds}"
+            )
+
+        endpoints[endpoint_key.strip()] = ErpEndpointConfig(
+            url=url,
+            method=method,
+            timeout_seconds=timeout_seconds,
+        )
+
+    return endpoints
+
+
 def load_config() -> Config:
     load_dotenv()
     max_jobs = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
@@ -378,6 +547,67 @@ def load_config() -> Config:
         except Exception as exc:
             logging.warning("Could not save WORKSTATION_ID to .env file: %s", exc)
 
+    erp_enabled = parse_bool_env("ERP_ENABLED", default=False)
+    erp_default_timeout_seconds = float(os.getenv("ERP_DEFAULT_TIMEOUT_SECONDS", "10"))
+    if erp_default_timeout_seconds <= 0:
+        raise ValueError(
+            f"ERP_DEFAULT_TIMEOUT_SECONDS must be > 0, got {erp_default_timeout_seconds}"
+        )
+
+    erp_endpoints_raw = os.getenv("ERP_ENDPOINTS_JSON", "{}").strip() or "{}"
+    erp_endpoints = parse_erp_endpoints(
+        erp_endpoints_raw,
+        default_timeout_seconds=erp_default_timeout_seconds,
+    )
+
+    erp_auth_mode = os.getenv("ERP_AUTH_MODE", "none").strip().lower()
+    if erp_auth_mode not in {"none", "bearer", "basic", "static_headers"}:
+        raise ValueError(
+            "ERP_AUTH_MODE must be one of: none, bearer, basic, static_headers"
+        )
+
+    erp_auth_bearer_token = os.getenv("ERP_AUTH_BEARER_TOKEN", "").strip() or None
+    erp_auth_basic_username = os.getenv("ERP_AUTH_BASIC_USERNAME", "").strip() or None
+    erp_auth_basic_password = os.getenv("ERP_AUTH_BASIC_PASSWORD", "").strip() or None
+
+    erp_auth_static_headers_raw = os.getenv("ERP_AUTH_STATIC_HEADERS_JSON", "").strip()
+    erp_auth_static_headers: Dict[str, str] = {}
+    if erp_auth_static_headers_raw:
+        try:
+            static_headers = json.loads(erp_auth_static_headers_raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"ERP_AUTH_STATIC_HEADERS_JSON must be valid JSON: {exc}"
+            ) from exc
+        if not isinstance(static_headers, dict):
+            raise ValueError("ERP_AUTH_STATIC_HEADERS_JSON must be a JSON object")
+        erp_auth_static_headers = {
+            str(k).strip(): str(v)
+            for k, v in static_headers.items()
+            if str(k).strip()
+        }
+
+    if erp_auth_mode == "bearer" and not erp_auth_bearer_token:
+        raise ValueError("ERP_AUTH_MODE=bearer requires ERP_AUTH_BEARER_TOKEN")
+    if erp_auth_mode == "basic" and (not erp_auth_basic_username or not erp_auth_basic_password):
+        raise ValueError(
+            "ERP_AUTH_MODE=basic requires ERP_AUTH_BASIC_USERNAME and ERP_AUTH_BASIC_PASSWORD"
+        )
+    if erp_auth_mode == "static_headers" and not erp_auth_static_headers:
+        raise ValueError(
+            "ERP_AUTH_MODE=static_headers requires ERP_AUTH_STATIC_HEADERS_JSON"
+        )
+
+    erp_retry_attempts = int(os.getenv("ERP_RETRY_ATTEMPTS", "0"))
+    if erp_retry_attempts < 0:
+        raise ValueError(f"ERP_RETRY_ATTEMPTS must be >= 0, got {erp_retry_attempts}")
+
+    erp_retry_backoff_seconds = float(os.getenv("ERP_RETRY_BACKOFF_SECONDS", "1"))
+    if erp_retry_backoff_seconds < 0:
+        raise ValueError(
+            f"ERP_RETRY_BACKOFF_SECONDS must be >= 0, got {erp_retry_backoff_seconds}"
+        )
+
     config = Config(
         print_agent_url=require_env("PRINT_AGENT_CALLBACK_URL"),
         print_agent_api_key=require_env("PRINT_AGENT_API_KEY"),
@@ -386,6 +616,16 @@ def load_config() -> Config:
         printer_timeout_seconds=float(os.getenv("PRINTER_TIMEOUT_SECONDS", "5")),
         max_concurrent_jobs=max_jobs,
         workstation_id=workstation_id,
+        erp_enabled=erp_enabled,
+        erp_endpoints=erp_endpoints,
+        erp_auth_mode=erp_auth_mode,
+        erp_auth_bearer_token=erp_auth_bearer_token,
+        erp_auth_basic_username=erp_auth_basic_username,
+        erp_auth_basic_password=erp_auth_basic_password,
+        erp_auth_static_headers=erp_auth_static_headers,
+        erp_retry_attempts=erp_retry_attempts,
+        erp_retry_backoff_seconds=erp_retry_backoff_seconds,
+        erp_default_timeout_seconds=erp_default_timeout_seconds,
     )
     pprint.pprint(config)
     return config
@@ -596,5 +836,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
