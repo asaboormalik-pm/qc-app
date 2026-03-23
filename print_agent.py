@@ -12,9 +12,11 @@ import os
 import socket
 import sys
 import time
+import random
 import pprint
 import threading
 import atexit
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,6 +45,12 @@ class Config:
     printer_timeout_seconds: float = 5.0
     max_concurrent_jobs: int = 3  # Support 2-3 printers per station
     workstation_id: str = ""  # Unique identifier for this workstation (for tracking)
+    erp_http_timeout_seconds: float = 10.0
+    erp_timeout_max_seconds: float = 60.0
+    erp_retry_max_attempts: int = 3
+    erp_retry_backoff_base_seconds: float = 0.5
+    erp_retry_backoff_max_seconds: float = 8.0
+    erp_retry_jitter_seconds: float = 0.25
 
 
 class PrintAgent:
@@ -251,6 +259,142 @@ class PrintAgent:
             error_message=(error_message[:500] if error_message else None),
         )
 
+    def _execute_erp_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute an ERP connector request with retry/backoff behavior.
+
+        Retries are performed for:
+        - requests network errors
+        - request timeouts
+        - HTTP status 408, 429, and all 5xx responses
+
+        4xx responses other than 408/429 are returned immediately without retry.
+        """
+        erp_request = job.get("erp_request")
+        if not isinstance(erp_request, dict):
+            raise ValueError("job missing required dict field 'erp_request'")
+
+        method = str(erp_request.get("method", "POST")).upper()
+        url = erp_request.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("erp_request.url must be a non-empty string")
+
+        request_headers = erp_request.get("headers") or {}
+        if not isinstance(request_headers, dict):
+            raise ValueError("erp_request.headers must be a dict when provided")
+
+        # Reuse the same correlation and idempotency values across all retries.
+        correlation_id = (
+            job.get("correlation_id")
+            or erp_request.get("correlation_id")
+            or str(uuid.uuid4())
+        )
+        idempotency_key = (
+            job.get("idempotency_key")
+            or erp_request.get("idempotency_key")
+            or str(uuid.uuid4())
+        )
+
+        headers = {str(k): str(v) for k, v in request_headers.items()}
+        headers["X-Correlation-Id"] = correlation_id
+        headers["Idempotency-Key"] = idempotency_key
+
+        timeout_override = (
+            job.get("timeout_seconds")
+            if job.get("timeout_seconds") is not None
+            else erp_request.get("timeout_seconds")
+        )
+        timeout_seconds = self.config.erp_http_timeout_seconds
+        if timeout_override is not None:
+            timeout_seconds = float(timeout_override)
+
+        # Connector-side cap: caller can reduce timeout but cannot exceed cap.
+        timeout_seconds = min(timeout_seconds, self.config.erp_timeout_max_seconds)
+        if timeout_seconds <= 0:
+            raise ValueError("ERP timeout_seconds must be > 0")
+
+        max_attempts = int(
+            job.get("max_attempts")
+            if job.get("max_attempts") is not None
+            else self.config.erp_retry_max_attempts
+        )
+        if max_attempts < 1:
+            raise ValueError("ERP max_attempts must be >= 1")
+
+        body = erp_request.get("body")
+        request_kwargs: Dict[str, Any] = {
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "timeout": timeout_seconds,
+        }
+        if body is not None:
+            # Send request body exactly as received; no wrapper/transform envelope.
+            request_kwargs["json"] = body if isinstance(body, (dict, list)) else None
+            if request_kwargs["json"] is None:
+                request_kwargs.pop("json", None)
+                request_kwargs["data"] = body
+
+        retryable_http_statuses = {408, 429}
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.request(**request_kwargs)
+                status = response.status_code
+                is_retryable_http = (status in retryable_http_statuses) or (500 <= status <= 599)
+
+                if is_retryable_http and attempt < max_attempts:
+                    backoff_seconds = min(
+                        self.config.erp_retry_backoff_base_seconds * (2 ** (attempt - 1)),
+                        self.config.erp_retry_backoff_max_seconds,
+                    )
+                    sleep_seconds = backoff_seconds + random.uniform(0, self.config.erp_retry_jitter_seconds)
+                    logging.warning(
+                        "ERP request retryable HTTP status=%s attempt=%d/%d sleeping=%.2fs",
+                        status,
+                        attempt,
+                        max_attempts,
+                        sleep_seconds,
+                    )
+                    time.sleep(sleep_seconds)
+                    continue
+
+                # Non-retryable 4xx (or final attempt for retryable codes).
+                if 400 <= status <= 499 and status not in retryable_http_statuses:
+                    return {
+                        "status_code": status,
+                        "headers": dict(response.headers),
+                        "body": response.text,
+                        "correlation_id": correlation_id,
+                        "idempotency_key": idempotency_key,
+                    }
+
+                response.raise_for_status()
+                return {
+                    "status_code": status,
+                    "headers": dict(response.headers),
+                    "body": response.text,
+                    "correlation_id": correlation_id,
+                    "idempotency_key": idempotency_key,
+                }
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if attempt >= max_attempts:
+                    raise
+                backoff_seconds = min(
+                    self.config.erp_retry_backoff_base_seconds * (2 ** (attempt - 1)),
+                    self.config.erp_retry_backoff_max_seconds,
+                )
+                sleep_seconds = backoff_seconds + random.uniform(0, self.config.erp_retry_jitter_seconds)
+                logging.warning(
+                    "ERP request network/timeout failure attempt=%d/%d error=%s sleeping=%.2fs",
+                    attempt,
+                    max_attempts,
+                    exc,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+            except requests.HTTPError:
+                # HTTPError here means final-attempt retryable HTTP failure.
+                raise
+
     def _notify_print_service(
         self,
         job_id: str,
@@ -386,6 +530,12 @@ def load_config() -> Config:
         printer_timeout_seconds=float(os.getenv("PRINTER_TIMEOUT_SECONDS", "5")),
         max_concurrent_jobs=max_jobs,
         workstation_id=workstation_id,
+        erp_http_timeout_seconds=float(os.getenv("ERP_HTTP_TIMEOUT_SECONDS", "10")),
+        erp_timeout_max_seconds=float(os.getenv("ERP_TIMEOUT_MAX_SECONDS", "60")),
+        erp_retry_max_attempts=int(os.getenv("ERP_RETRY_MAX_ATTEMPTS", "3")),
+        erp_retry_backoff_base_seconds=float(os.getenv("ERP_RETRY_BACKOFF_BASE_SECONDS", "0.5")),
+        erp_retry_backoff_max_seconds=float(os.getenv("ERP_RETRY_BACKOFF_MAX_SECONDS", "8")),
+        erp_retry_jitter_seconds=float(os.getenv("ERP_RETRY_JITTER_SECONDS", "0.25")),
     )
     pprint.pprint(config)
     return config
@@ -596,5 +746,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
