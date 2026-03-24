@@ -280,16 +280,36 @@ class PrintAgent:
         except Exception as exc:
             logging.error("Unexpected error sending callback for job %s: %s", job_id, exc)
 
+    def _execute_erp_job(self, job: Dict[str, Any]) -> None:
+        """Execute an ERP channel job."""
+        erp_request = job["erp_request"]
+        if not isinstance(erp_request, dict):
+            raise ValueError("job field 'erp_request' must be a dict")
+
+        logging.info("Processing ERP request for job=%s", job.get("id"))
+        # Placeholder for ERP dispatch implementation.
+        # Keeping this method isolated allows future ERP adapters without
+        # changing process_job() flow.
+
     def process_job(self, job: Dict[str, Any]) -> bool:
         """Process a single print job (thread-safe)."""
         job_id = job.get("id")
         if not job_id:
             raise ValueError(f"Job missing required 'id' field: {job}")
+        channel = job.get("channel", "printer")
         thread_id = threading.current_thread().name
-        logging.info("[%s] processing job=%s printer_ip=%s printer_port=%s",
-                     thread_id, job_id, job.get("printer_ip"), job.get("printer_port"))
+        logging.info("[%s] processing job=%s channel=%s printer_ip=%s printer_port=%s",
+                     thread_id, job_id, channel, job.get("printer_ip"), job.get("printer_port"))
         try:
-            self._send_to_printer(job)
+            if channel == "printer":
+                self._send_to_printer(job)
+            elif channel == "erp":
+                self._execute_erp_job(job)
+            else:
+                error_message = f"UNSUPPORTED_CHANNEL: unsupported channel '{channel}'"
+                self._mark_failed(job_id, error_message)
+                logging.error("[%s] failed job=%s error=%s", thread_id, job_id, error_message)
+                return False
         except Exception as exc:
             self._mark_failed(job_id, str(exc))
             logging.error("[%s] failed job=%s error=%s", thread_id, job_id, exc)
@@ -596,5 +616,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
