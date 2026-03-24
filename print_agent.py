@@ -15,6 +15,8 @@ import time
 import pprint
 import threading
 import atexit
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +34,7 @@ import requests
 
 
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
+DEFAULT_CALLBACK_RETRIES = 3
 
 
 @dataclass
@@ -222,9 +225,16 @@ class PrintAgent:
             raise ValueError("job missing valid zpl_data string")
         if not zpl.strip():
             raise ValueError("zpl_data is empty or whitespace only")
-        # Log ZPL at DEBUG level with truncation for very long payloads
-        zpl_preview = zpl[:200] + "..." if len(zpl) > 200 else zpl
-        logging.debug("ZPL data for job=%s:\n%s", job.get("id"), zpl_preview)
+        zpl_bytes = zpl.encode("utf-8")
+        payload_hash = hashlib.sha256(zpl_bytes).hexdigest()
+        logging.debug(
+            "job=%s payload metadata size_bytes=%d sha256=%s message_id=%s correlation_id=%s",
+            job.get("id"),
+            len(zpl_bytes),
+            payload_hash,
+            job.get("message_id"),
+            job.get("correlation_id"),
+        )
 
         try:
             # Use context manager for guaranteed socket cleanup
@@ -232,7 +242,7 @@ class PrintAgent:
                 (printer_ip, printer_port),
                 timeout=self.config.printer_timeout_seconds,
             ) as sock:
-                sock.sendall(zpl.encode("utf-8"))
+                sock.sendall(zpl_bytes)
             logging.info("Label sent to printer at %s:%s", printer_ip, printer_port)
         except socket.timeout:
             raise Exception(f"Connection timeout to printer {printer_ip}:{printer_port}")
@@ -380,6 +390,7 @@ class PrintAgent:
         duration_ms: Optional[int] = None,
         erp_body: Any = None,
     ) -> None:
+        job_id = job.get("id")
         payload = {
             # Compatibility fields
             "jobId": job_id,
@@ -403,14 +414,35 @@ class PrintAgent:
             # Parsed ERP response body (truncated/redacted as needed)
             "erpBody": self._prepare_erp_body(erp_body),
         }
+        payload_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+        callback_headers = dict(self.headers)
+        callback_headers["Content-Length"] = str(len(payload_bytes))
         try:
-            response = requests.post(
-                self.config.print_agent_url,
-                headers=self.headers,
-                json=payload,
-                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
+            for attempt in range(1, DEFAULT_CALLBACK_RETRIES + 1):
+                try:
+                    response = requests.post(
+                        self.config.print_agent_url,
+                        headers=callback_headers,
+                        data=payload_bytes,
+                        timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+                    )
+                    response.raise_for_status()
+                    return
+                except (requests.ConnectionError, requests.Timeout) as exc:
+                    if attempt == DEFAULT_CALLBACK_RETRIES:
+                        raise
+                    logging.warning(
+                        "callback retrying job=%s status=%s attempt=%d/%d size_bytes=%d sha256=%s error=%s",
+                        job_id,
+                        status,
+                        attempt,
+                        DEFAULT_CALLBACK_RETRIES,
+                        len(payload_bytes),
+                        payload_hash,
+                        exc,
+                    )
+                    time.sleep(0.5 * attempt)
         except requests.ConnectionError as exc:
             logging.error("Connection error sending callback for job %s: %s", job_id, exc)
             # Don't raise - agent will continue processing other jobs
@@ -421,17 +453,37 @@ class PrintAgent:
         except Exception as exc:
             logging.error("Unexpected error sending callback for job %s: %s", job_id, exc)
 
+    def _execute_erp_job(self, job: Dict[str, Any]) -> None:
+        """Execute an ERP channel job."""
+        erp_request = job["erp_request"]
+        if not isinstance(erp_request, dict):
+            raise ValueError("job field 'erp_request' must be a dict")
+
+        logging.info("Processing ERP request for job=%s", job.get("id"))
+        # Placeholder for ERP dispatch implementation.
+        # Keeping this method isolated allows future ERP adapters without
+        # changing process_job() flow.
+
     def process_job(self, job: Dict[str, Any]) -> bool:
         """Process a single print job (thread-safe)."""
         job_id = job.get("id")
         if not job_id:
             raise ValueError(f"Job missing required 'id' field: {job}")
+        channel = job.get("channel", "printer")
         thread_id = threading.current_thread().name
         logging.info("[%s] processing job=%s printer_ip=%s printer_port=%s",
                      thread_id, job_id, job.get("printer_ip"), job.get("printer_port"))
         started_at = time.monotonic()
         try:
-            self._send_to_printer(job)
+            if channel == "printer":
+                self._send_to_printer(job)
+            elif channel == "erp":
+                self._execute_erp_job(job)
+            else:
+                error_message = f"UNSUPPORTED_CHANNEL: unsupported channel '{channel}'"
+                self._mark_failed(job_id, error_message)
+                logging.error("[%s] failed job=%s error=%s", thread_id, job_id, error_message)
+                return False
         except Exception as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             self._mark_failed(job, str(exc), duration_ms=duration_ms)
