@@ -15,6 +15,8 @@ import time
 import pprint
 import threading
 import atexit
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +34,7 @@ import requests
 
 
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
+DEFAULT_CALLBACK_RETRIES = 3
 
 
 @dataclass
@@ -112,7 +115,7 @@ class PrintAgent:
                                                 job.get("id"), exc)
                                 # Mark job as failed in backend
                                 try:
-                                    self._mark_failed(job.get("id"), str(exc))
+                                    self._mark_failed(job, str(exc))
                                 except Exception as callback_exc:
                                     logging.error("Failed to mark job %s as failed: %s",
                                                  job.get("id"), callback_exc)
@@ -222,9 +225,16 @@ class PrintAgent:
             raise ValueError("job missing valid zpl_data string")
         if not zpl.strip():
             raise ValueError("zpl_data is empty or whitespace only")
-        # Log ZPL at DEBUG level with truncation for very long payloads
-        zpl_preview = zpl[:200] + "..." if len(zpl) > 200 else zpl
-        logging.debug("ZPL data for job=%s:\n%s", job.get("id"), zpl_preview)
+        zpl_bytes = zpl.encode("utf-8")
+        payload_hash = hashlib.sha256(zpl_bytes).hexdigest()
+        logging.debug(
+            "job=%s payload metadata size_bytes=%d sha256=%s message_id=%s correlation_id=%s",
+            job.get("id"),
+            len(zpl_bytes),
+            payload_hash,
+            job.get("message_id"),
+            job.get("correlation_id"),
+        )
 
         try:
             # Use context manager for guaranteed socket cleanup
@@ -232,7 +242,7 @@ class PrintAgent:
                 (printer_ip, printer_port),
                 timeout=self.config.printer_timeout_seconds,
             ) as sock:
-                sock.sendall(zpl.encode("utf-8"))
+                sock.sendall(zpl_bytes)
             logging.info("Label sent to printer at %s:%s", printer_ip, printer_port)
         except socket.timeout:
             raise Exception(f"Connection timeout to printer {printer_ip}:{printer_port}")
@@ -241,35 +251,63 @@ class PrintAgent:
         except OSError as e:
             raise Exception(f"Network error communicating with printer {printer_ip}:{printer_port}: {e}")
 
-    def _mark_done(self, job_id: str) -> None:
-        self._notify_print_service(job_id=job_id, status="completed", error_message=None)
+    def _mark_done(self, job: Dict[str, Any]) -> None:
+        self._notify_print_service(job=job, status="completed", error_message=None)
 
-    def _mark_failed(self, job_id: str, error_message: str) -> None:
+    def _mark_failed(self, job: Dict[str, Any], error_message: str) -> None:
         self._notify_print_service(
-            job_id=job_id,
+            job=job,
             status="failed",
             error_message=(error_message[:500] if error_message else None),
         )
 
     def _notify_print_service(
         self,
-        job_id: str,
+        job: Dict[str, Any],
         status: str,
         error_message: Optional[str],
     ) -> None:
+        job_id = job.get("id")
         payload = {
             "jobId": job_id,
             "status": status,
             "errorMessage": error_message,
+            "callbackDetails": {
+                "messageId": job.get("message_id"),
+                "correlationId": job.get("correlation_id"),
+                "workstationId": self.config.workstation_id,
+                "processedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
         }
+        payload_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+        callback_headers = dict(self.headers)
+        callback_headers["Content-Length"] = str(len(payload_bytes))
         try:
-            response = requests.post(
-                self.config.print_agent_url,
-                headers=self.headers,
-                json=payload,
-                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
+            for attempt in range(1, DEFAULT_CALLBACK_RETRIES + 1):
+                try:
+                    response = requests.post(
+                        self.config.print_agent_url,
+                        headers=callback_headers,
+                        data=payload_bytes,
+                        timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+                    )
+                    response.raise_for_status()
+                    return
+                except (requests.ConnectionError, requests.Timeout) as exc:
+                    if attempt == DEFAULT_CALLBACK_RETRIES:
+                        raise
+                    logging.warning(
+                        "callback retrying job=%s status=%s attempt=%d/%d size_bytes=%d sha256=%s error=%s",
+                        job_id,
+                        status,
+                        attempt,
+                        DEFAULT_CALLBACK_RETRIES,
+                        len(payload_bytes),
+                        payload_hash,
+                        exc,
+                    )
+                    time.sleep(0.5 * attempt)
         except requests.ConnectionError as exc:
             logging.error("Connection error sending callback for job %s: %s", job_id, exc)
             # Don't raise - agent will continue processing other jobs
@@ -311,12 +349,12 @@ class PrintAgent:
                 logging.error("[%s] failed job=%s error=%s", thread_id, job_id, error_message)
                 return False
         except Exception as exc:
-            self._mark_failed(job_id, str(exc))
+            self._mark_failed(job, str(exc))
             logging.error("[%s] failed job=%s error=%s", thread_id, job_id, exc)
             return False
 
         try:
-            self._mark_done(job_id)
+            self._mark_done(job)
         except Exception as exc:
             logging.error(
                 "[%s] completion callback failed after successful print job=%s error=%s",
@@ -616,4 +654,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
