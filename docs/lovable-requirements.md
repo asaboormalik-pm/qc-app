@@ -110,6 +110,18 @@ const corsHeaders = {
 
 ---
 
+## 5. ERP Execution Path Guardrails (Do Not Break)
+
+For ERP-originated counting flows, keep connector/edge behavior as a pure transport layer:
+
+1. **Do not derive or alter item statuses** (`happy_path`, `damaged`, `anomaly`, `excess`, `unknown_excess`).
+2. **Do not recompute shortages or summary fields** in the connector.
+3. **Log metadata only by default** (`message_id`, `correlation_id`, payload `size`, payload `hash`) and avoid logging full payloads.
+4. **Retry with identical request bytes/content** (no mutation between attempts).
+5. **Return enough callback detail** (`message_id`, `correlation_id`, processing timestamps, transport metadata) so Lovable can apply final counting formulas server-side.
+
+---
+
 ## Python Agent Request Headers
 
 The agent now sends these headers with every request:
