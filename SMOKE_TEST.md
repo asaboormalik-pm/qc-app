@@ -52,9 +52,17 @@ The edge function is responsible for moving fetched jobs from `pending` to `proc
 {
   "jobId": "uuid-of-the-print-job",
   "status": "completed",
-  "errorMessage": null
+  "errorMessage": null,
+  "callbackDetails": {
+    "messageId": "optional-upstream-message-id",
+    "correlationId": "optional-upstream-correlation-id",
+    "workstationId": "uuid-v4-workstation-id",
+    "processedAt": "2026-03-23T10:00:00Z"
+  }
 }
 ```
+
+> Connector/agent callback is transport-only: it must not derive ERP counting statuses or recompute shortage/summary formulas.
 
 ## Smoke test sequence
 

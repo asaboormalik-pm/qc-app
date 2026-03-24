@@ -34,6 +34,7 @@ import requests
 
 
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
+DEFAULT_CALLBACK_RETRIES = 3
 
 
 @dataclass
@@ -120,7 +121,7 @@ class PrintAgent:
                                                 job.get("id"), exc)
                                 # Mark job as failed in backend
                                 try:
-                                    self._mark_failed(job.get("id"), str(exc))
+                                    self._mark_failed(job, str(exc))
                                 except Exception as callback_exc:
                                     logging.error("Failed to mark job %s as failed: %s",
                                                  job.get("id"), callback_exc)
@@ -230,9 +231,16 @@ class PrintAgent:
             raise ValueError("job missing valid zpl_data string")
         if not zpl.strip():
             raise ValueError("zpl_data is empty or whitespace only")
-        # Log ZPL at DEBUG level with truncation for very long payloads
-        zpl_preview = zpl[:200] + "..." if len(zpl) > 200 else zpl
-        logging.debug("ZPL data for job=%s:\n%s", job.get("id"), zpl_preview)
+        zpl_bytes = zpl.encode("utf-8")
+        payload_hash = hashlib.sha256(zpl_bytes).hexdigest()
+        logging.debug(
+            "job=%s payload metadata size_bytes=%d sha256=%s message_id=%s correlation_id=%s",
+            job.get("id"),
+            len(zpl_bytes),
+            payload_hash,
+            job.get("message_id"),
+            job.get("correlation_id"),
+        )
 
         try:
             # Use context manager for guaranteed socket cleanup
@@ -240,7 +248,7 @@ class PrintAgent:
                 (printer_ip, printer_port),
                 timeout=self.config.printer_timeout_seconds,
             ) as sock:
-                sock.sendall(zpl.encode("utf-8"))
+                sock.sendall(zpl_bytes)
             logging.info("Label sent to printer at %s:%s", printer_ip, printer_port)
         except socket.timeout:
             raise Exception(f"Connection timeout to printer {printer_ip}:{printer_port}")
@@ -249,14 +257,124 @@ class PrintAgent:
         except OSError as e:
             raise Exception(f"Network error communicating with printer {printer_ip}:{printer_port}: {e}")
 
-    def _mark_done(self, job_id: str) -> None:
-        self._notify_print_service(job_id=job_id, status="completed", error_message=None)
+    def _sanitize_payload_text(self, value: Any, max_length: int = 2000) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value)
+        lowered = text.lower()
+        for marker in ("authorization:", "api-key", "x-api-key", "token", "bearer "):
+            if marker in lowered:
+                return "[redacted]"
+        if len(text) > max_length:
+            return f"{text[:max_length]}... [truncated]"
+        return text
 
-    def _mark_failed(self, job_id: str, error_message: str) -> None:
+    def _parse_optional_int(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_job_field(self, job: Dict[str, Any], *keys: str) -> Any:
+        metadata = job.get("metadata")
+        for key in keys:
+            if key in job and job.get(key) is not None:
+                return job.get(key)
+            if isinstance(metadata, dict) and key in metadata and metadata.get(key) is not None:
+                return metadata.get(key)
+        return None
+
+    def _extract_job_context(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "channel": self._extract_job_field(job, "channel") or "print",
+            "attempt": self._parse_optional_int(self._extract_job_field(job, "attempt")),
+            "max_attempts": self._parse_optional_int(
+                self._extract_job_field(job, "maxAttempts", "max_attempts")
+            ),
+            "endpoint_key": self._extract_job_field(job, "endpointKey", "endpoint_key"),
+            "business_type": self._extract_job_field(job, "businessType", "business_type"),
+            "business_id": self._extract_job_field(job, "businessId", "business_id"),
+            "correlation_id": self._extract_job_field(job, "correlationId", "correlation_id"),
+            "erp_body": self._extract_job_field(
+                job,
+                "erpBody",
+                "erp_body",
+                "erpResponseBody",
+                "erp_response_body",
+                "responseBody",
+                "response_body",
+            ),
+        }
+
+    def _prepare_erp_body(self, erp_body: Any) -> Any:
+        if erp_body is None:
+            return None
+        if isinstance(erp_body, (dict, list)):
+            return erp_body
+        return self._sanitize_payload_text(erp_body)
+
+    def _classify_error(self, error_message: str) -> str:
+        lowered = error_message.lower()
+        if "timeout" in lowered:
+            return "printer_timeout"
+        if "refused" in lowered:
+            return "connection_refused"
+        if "missing valid" in lowered or "out of valid range" in lowered or "empty" in lowered:
+            return "invalid_job_payload"
+        return "printer_transport_error"
+
+    def _failure_status_for_attempt(self, attempt: Optional[int], max_attempts: Optional[int]) -> str:
+        if attempt is not None and max_attempts is not None and attempt < max_attempts:
+            return "retry_scheduled"
+        return "failed"
+
+    def _mark_done(self, job: Dict[str, Any], duration_ms: Optional[int] = None) -> None:
+        context = self._extract_job_context(job)
         self._notify_print_service(
-            job_id=job_id,
-            status="failed",
-            error_message=(error_message[:500] if error_message else None),
+            job_id=job.get("id"),
+            status="completed",
+            error_message=None,
+            channel=context["channel"],
+            attempt=context["attempt"],
+            max_attempts=context["max_attempts"],
+            endpoint_key=context["endpoint_key"],
+            business_type=context["business_type"],
+            business_id=context["business_id"],
+            correlation_id=context["correlation_id"],
+            response_code=200,
+            retryable=False,
+            error_code=None,
+            transport_error_message=None,
+            duration_ms=duration_ms,
+            erp_body=context["erp_body"],
+        )
+
+    def _mark_failed(self, job: Dict[str, Any], error_message: str, duration_ms: Optional[int] = None) -> None:
+        context = self._extract_job_context(job)
+        attempt = context["attempt"]
+        max_attempts = context["max_attempts"]
+        status = self._failure_status_for_attempt(attempt, max_attempts)
+        sanitized_error = self._sanitize_payload_text(error_message, max_length=500)
+        retryable = status == "retry_scheduled"
+        self._notify_print_service(
+            job_id=job.get("id"),
+            status=status,
+            error_message=sanitized_error,
+            channel=context["channel"],
+            attempt=attempt,
+            max_attempts=max_attempts,
+            endpoint_key=context["endpoint_key"],
+            business_type=context["business_type"],
+            business_id=context["business_id"],
+            correlation_id=context["correlation_id"],
+            response_code=429 if retryable else 500,
+            retryable=retryable,
+            error_code=self._classify_error(error_message),
+            transport_error_message=sanitized_error,
+            duration_ms=duration_ms,
+            erp_body=context["erp_body"],
         )
 
     def _execute_erp_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
@@ -397,23 +515,76 @@ class PrintAgent:
 
     def _notify_print_service(
         self,
-        job_id: str,
+        job_id: Optional[str],
         status: str,
         error_message: Optional[str],
+        channel: Optional[str] = None,
+        attempt: Optional[int] = None,
+        max_attempts: Optional[int] = None,
+        endpoint_key: Optional[str] = None,
+        business_type: Optional[str] = None,
+        business_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        response_code: Optional[int] = None,
+        retryable: Optional[bool] = None,
+        error_code: Optional[str] = None,
+        transport_error_message: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        erp_body: Any = None,
     ) -> None:
+        job_id = job.get("id")
         payload = {
+            # Compatibility fields
             "jobId": job_id,
             "status": status,
             "errorMessage": error_message,
+            # Extended callback context
+            "channel": channel,
+            "attempt": attempt,
+            "maxAttempts": max_attempts,
+            "endpointKey": endpoint_key,
+            "businessType": business_type,
+            "businessId": business_id,
+            "correlationId": correlation_id,
+            # Transport result fields
+            "responseCode": response_code,
+            "retryable": retryable,
+            "errorCode": error_code,
+            "durationMs": duration_ms,
+            # Keep both compatibility and transport-level error detail
+            "transportErrorMessage": transport_error_message,
+            # Parsed ERP response body (truncated/redacted as needed)
+            "erpBody": self._prepare_erp_body(erp_body),
         }
+        payload_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+        callback_headers = dict(self.headers)
+        callback_headers["Content-Length"] = str(len(payload_bytes))
         try:
-            response = requests.post(
-                self.config.print_agent_url,
-                headers=self.headers,
-                json=payload,
-                timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
+            for attempt in range(1, DEFAULT_CALLBACK_RETRIES + 1):
+                try:
+                    response = requests.post(
+                        self.config.print_agent_url,
+                        headers=callback_headers,
+                        data=payload_bytes,
+                        timeout=DEFAULT_HTTP_TIMEOUT_SECONDS,
+                    )
+                    response.raise_for_status()
+                    return
+                except (requests.ConnectionError, requests.Timeout) as exc:
+                    if attempt == DEFAULT_CALLBACK_RETRIES:
+                        raise
+                    logging.warning(
+                        "callback retrying job=%s status=%s attempt=%d/%d size_bytes=%d sha256=%s error=%s",
+                        job_id,
+                        status,
+                        attempt,
+                        DEFAULT_CALLBACK_RETRIES,
+                        len(payload_bytes),
+                        payload_hash,
+                        exc,
+                    )
+                    time.sleep(0.5 * attempt)
         except requests.ConnectionError as exc:
             logging.error("Connection error sending callback for job %s: %s", job_id, exc)
             # Don't raise - agent will continue processing other jobs
@@ -424,23 +595,46 @@ class PrintAgent:
         except Exception as exc:
             logging.error("Unexpected error sending callback for job %s: %s", job_id, exc)
 
+    def _execute_erp_job(self, job: Dict[str, Any]) -> None:
+        """Execute an ERP channel job."""
+        erp_request = job["erp_request"]
+        if not isinstance(erp_request, dict):
+            raise ValueError("job field 'erp_request' must be a dict")
+
+        logging.info("Processing ERP request for job=%s", job.get("id"))
+        # Placeholder for ERP dispatch implementation.
+        # Keeping this method isolated allows future ERP adapters without
+        # changing process_job() flow.
+
     def process_job(self, job: Dict[str, Any]) -> bool:
         """Process a single print job (thread-safe)."""
         job_id = job.get("id")
         if not job_id:
             raise ValueError(f"Job missing required 'id' field: {job}")
+        channel = job.get("channel", "printer")
         thread_id = threading.current_thread().name
         logging.info("[%s] processing job=%s printer_ip=%s printer_port=%s",
                      thread_id, job_id, job.get("printer_ip"), job.get("printer_port"))
+        started_at = time.monotonic()
         try:
-            self._send_to_printer(job)
+            if channel == "printer":
+                self._send_to_printer(job)
+            elif channel == "erp":
+                self._execute_erp_job(job)
+            else:
+                error_message = f"UNSUPPORTED_CHANNEL: unsupported channel '{channel}'"
+                self._mark_failed(job_id, error_message)
+                logging.error("[%s] failed job=%s error=%s", thread_id, job_id, error_message)
+                return False
         except Exception as exc:
-            self._mark_failed(job_id, str(exc))
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            self._mark_failed(job, str(exc), duration_ms=duration_ms)
             logging.error("[%s] failed job=%s error=%s", thread_id, job_id, exc)
             return False
 
+        duration_ms = int((time.monotonic() - started_at) * 1000)
         try:
-            self._mark_done(job_id)
+            self._mark_done(job, duration_ms=duration_ms)
         except Exception as exc:
             logging.error(
                 "[%s] completion callback failed after successful print job=%s error=%s",

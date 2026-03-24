@@ -128,7 +128,13 @@ sudo journalctl -u qc-print-agent -f
 {
   "jobId": "uuid-of-the-print-job",
   "status": "completed",
-  "errorMessage": null
+  "errorMessage": null,
+  "callbackDetails": {
+    "messageId": "optional-upstream-message-id",
+    "correlationId": "optional-upstream-correlation-id",
+    "workstationId": "uuid-v4-workstation-id",
+    "processedAt": "2026-03-23T10:00:00Z"
+  }
 }
 ```
 
