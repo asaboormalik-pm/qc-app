@@ -18,6 +18,9 @@ import threading
 import atexit
 import json
 import base64
+import hashlib
+import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,6 +67,270 @@ class Config:
     erp_retry_attempts: int = 0
     erp_retry_backoff_seconds: float = 1.0
     erp_default_timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS
+    # Advanced ERP retry settings
+    erp_timeout_max_seconds: float = 30.0
+    erp_retry_max_attempts: int = 3
+    erp_retry_backoff_base_seconds: float = 1.0
+    erp_retry_backoff_max_seconds: float = 60.0
+    erp_retry_jitter_seconds: float = 1.0
+    # ERP-agent specific settings (separate from print jobs)
+    erp_agent_enabled: bool = False
+    erp_agent_url: str = ""
+    erp_agent_api_key: str = ""
+    erp_agent_poll_interval_seconds: float = 2.0
+    erp_agent_max_concurrent_requests: int = 2
+
+
+@dataclass
+class ErpBoxFetchRequest:
+    """Normalized ERP box fetch request from erp-agent."""
+    request_id: str
+    invoice_id: str
+    quantity: int
+    attempts: int
+    max_attempts: int
+    request_payload: Optional[Dict[str, Any]]
+    invoice_message_id: Optional[str]
+    client_id: Optional[str]
+    warehouse_id: Optional[str]
+
+
+@dataclass
+class GenericErpRequest:
+    """Generic ERP request from erp-agent (supports multiple business types)."""
+    request_id: str
+    business_type: str
+    endpoint_key: str
+    request_payload: Optional[Dict[str, Any]]
+    attempts: int
+    max_attempts: int
+    # Optional fields (for box fetch compatibility)
+    invoice_id: Optional[str] = None
+    quantity: Optional[int] = None
+    invoice_message_id: Optional[str] = None
+    client_id: Optional[str] = None
+    warehouse_id: Optional[str] = None
+
+
+class ErpAgentClient:
+    """Client for communicating with the erp-agent edge function."""
+
+    def __init__(self, url: str, api_key: str, workstation_id: str, timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS):
+        self.url = url
+        self.api_key = api_key
+        self.workstation_id = workstation_id
+        self.timeout = timeout
+        self.headers = {
+            "X-API-Key": api_key,
+            "X-Workstation-Id": workstation_id,
+            "Content-Type": "application/json",
+        }
+
+    def poll_requests(self, limit: int) -> List[GenericErpRequest]:
+        """Poll for pending ERP requests (supports multiple business types).
+
+        Returns:
+            List of normalized GenericErpRequest objects.
+        """
+        try:
+            response = requests.get(
+                self.url,
+                headers=self.headers,
+                params={"action": "poll", "limit": str(limit)},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+        except requests.ConnectionError as exc:
+            logging.warning("[ERP-AGENT] Connection error: %s - will retry", exc)
+            return []
+        except requests.Timeout as exc:
+            logging.warning("[ERP-AGENT] Request timeout: %s - will retry", exc)
+            return []
+        except requests.HTTPError as exc:
+            logging.error("[ERP-AGENT] HTTP error polling requests: %s", exc)
+            # Log response body for debugging
+            if exc.response is not None:
+                try:
+                    logging.error("[ERP-AGENT] Response status: %s", exc.response.status_code)
+                    logging.error("[ERP-AGENT] Response body (first 500 chars): %s", exc.response.text[:500])
+                except Exception as log_exc:
+                    logging.error("[ERP-AGENT] Could not log response details: %s", log_exc)
+            return []
+        except ValueError as exc:
+            logging.error("[ERP-AGENT] Invalid JSON response: %s", exc)
+            return []
+
+        # Extract requests from response
+        raw_requests: List[Dict[str, Any]]
+        if isinstance(body, dict):
+            raw_requests = body.get("requests") or []
+        elif isinstance(body, list):
+            raw_requests = body
+        else:
+            logging.error("[ERP-AGENT] Unexpected poll response format: %s", type(body))
+            return []
+
+        # Normalize into GenericErpRequest objects
+        fetched_requests = []
+        for req in raw_requests:
+            try:
+                # Extract required routing fields
+                business_type = req.get("business_type")
+                endpoint_key = req.get("endpoint_key")
+
+                if not business_type:
+                    logging.error("[ERP-AGENT] Missing business_type in request: %s", req.get("id"))
+                    continue
+                if not endpoint_key:
+                    logging.error("[ERP-AGENT] Missing endpoint_key in request: %s", req.get("id"))
+                    continue
+
+                # Log incoming request with business_type for debugging
+                logging.info("[ERP-AGENT] INCOMING AGENT REQUEST business_type=%s request_id=%s: %s",
+                           business_type, req.get("id"), json.dumps(req, ensure_ascii=False))
+
+                # For backwards compatibility, support old box fetch format without business_type
+                if business_type not in ("erp_box_fetch", "completion_event"):
+                    logging.error("[ERP-AGENT] Unknown business_type: %s for request_id=%s",
+                                 business_type, req.get("id"))
+                    continue
+
+                # Defensive check: skip requests that have exceeded max_attempts
+                # This prevents infinite retry loops when backend doesn't properly filter them
+                attempts = int(req.get("attempts", 0))
+                max_attempts = int(req.get("max_attempts", 3))
+                if attempts >= max_attempts:
+                    logging.warning(
+                        "[ERP-AGENT] Skipping request_id=%s that has exceeded max_attempts (attempts=%d, max_attempts=%d). "
+                        "Backend should have filtered this out - marking as failed.",
+                        req.get("id"), attempts, max_attempts
+                    )
+                    # Notify backend to mark as failed (defensive measure)
+                    try:
+                        self.post_failure(req.get("id"), f"Exceeded max_attempts ({attempts}/{max_attempts})")
+                    except Exception as exc:
+                        logging.error("[ERP-AGENT] Failed to post failure for exhausted request_id=%s: %s",
+                                     req.get("id"), exc)
+                    continue
+
+                # Extract request_payload with fallback for completion_event
+                # Some backends may send completion data in different fields
+                request_payload = req.get("request_payload")
+                if request_payload is None:
+                    # Try alternative field names for completion events
+                    if business_type == "completion_event":
+                        request_payload = req.get("payload") or req.get("erp_payload")
+                        if request_payload is None:
+                            # Build minimal payload from top-level fields as last resort
+                            request_payload = {
+                                "message_id": req.get("message_id"),
+                                "invoice_id": req.get("invoice_id"),
+                                "client_id": req.get("client_id"),
+                                "operator_id": req.get("operator_id"),
+                                "warehouse_id": req.get("warehouse_id"),
+                                "boxes": req.get("boxes"),
+                                "shortages": req.get("shortages"),
+                                "summary": req.get("summary"),
+                                "timestamp": req.get("timestamp"),
+                            }
+                            # Remove None values
+                            request_payload = {k: v for k, v in request_payload.items() if v is not None}
+                            if request_payload:
+                                logging.warning("[ERP-AGENT] request_payload missing for completion_event request_id=%s, built from top-level fields: %s",
+                                               req.get("id"), list(request_payload.keys()))
+
+                fetched_requests.append(GenericErpRequest(
+                    request_id=req.get("id", ""),
+                    business_type=business_type,
+                    endpoint_key=endpoint_key,
+                    request_payload=request_payload,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                    # Optional fields (for box fetch compatibility)
+                    invoice_id=req.get("invoice_id"),
+                    quantity=int(req.get("quantity", 0)) if req.get("quantity") else None,
+                    invoice_message_id=req.get("invoice_message_id"),
+                    client_id=req.get("client_id"),
+                    warehouse_id=req.get("warehouse_id"),
+                ))
+            except (ValueError, TypeError) as exc:
+                logging.error("[ERP-AGENT] Invalid request format, skipping: %s", exc)
+
+        if fetched_requests:
+            logging.info("[ERP-AGENT] Polled %d requests", len(fetched_requests))
+
+        return fetched_requests
+
+    def post_success(self, request_id: str, boxes: List[Dict[str, Any]]) -> None:
+        """Post successful box fetch result with boxes to erp-agent."""
+        self._post_result({
+            "request_id": request_id,
+            "business_type": "erp_box_fetch",
+            "status": "completed",
+            "boxes": boxes,
+        })
+
+    def post_failure(self, request_id: str, error_message: str) -> None:
+        """Post failure result to erp-agent."""
+        self._post_result({
+            "request_id": request_id,
+            "status": "failed",
+            "error_message": error_message,
+        })
+
+    def post_completion_success(self, request_id: str, erp_response: Dict[str, Any]) -> None:
+        """Post successful completion event result to erp-agent."""
+        self._post_result({
+            "request_id": request_id,
+            "business_type": "completion_event",
+            "status": "completed",
+            "erp_status_code": 200,
+            "erp_response": erp_response,
+        })
+
+    def post_completion_failure(self, request_id: str, error_message: str) -> None:
+        """Post completion event failure result to erp-agent."""
+        self._post_result({
+            "request_id": request_id,
+            "business_type": "completion_event",
+            "status": "failed",
+            "error_message": error_message,
+        })
+
+    def _post_result(self, payload: Dict[str, Any]) -> None:
+        """Post result to erp-agent with retry logic."""
+        request_id = payload.get("request_id", "unknown")
+        business_type = payload.get("business_type", "unknown")
+        payload_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        payload_preview = json.dumps(payload, ensure_ascii=False)
+
+        for attempt in range(1, DEFAULT_CALLBACK_RETRIES + 1):
+            try:
+                response = requests.post(
+                    self.url,
+                    headers=self.headers,
+                    data=payload_bytes,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                logging.info("[ERP-AGENT] Callback succeeded business_type=%s request_id=%s status=%s",
+                           business_type, request_id, payload.get("status"))
+                logging.info("[ERP-AGENT] Callback payload request_id=%s body=%s",
+                           request_id, payload_preview)
+                return
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt == DEFAULT_CALLBACK_RETRIES:
+                    logging.error("[ERP-AGENT] Callback failed after %d attempts for request_id=%s: %s",
+                                DEFAULT_CALLBACK_RETRIES, request_id, exc)
+                    raise
+                logging.warning("[ERP-AGENT] Callback retrying request_id=%s attempt=%d/%d: %s",
+                              request_id, attempt, DEFAULT_CALLBACK_RETRIES, exc)
+                time.sleep(0.5 * attempt)
+            except requests.HTTPError as exc:
+                logging.error("[ERP-AGENT] HTTP error in callback for request_id=%s: %s",
+                            request_id, exc)
+                raise
 
 
 class PrintAgent:
@@ -124,7 +391,18 @@ class PrintAgent:
 
         return headers
 
-    def _send_to_erp(self, job: Dict[str, Any]) -> None:
+    def _send_to_erp(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        """Send ERP request using local endpoint config (whitelist security model).
+
+        Retries are performed for:
+        - Network errors and timeouts
+        - HTTP status 408, 429, and all 5xx responses
+
+        4xx responses other than 408/429 are returned immediately without retry.
+
+        Returns:
+            Dict with response details including correlation_id and idempotency_key.
+        """
         if not self.config.erp_enabled:
             raise ValueError("ERP job received but ERP_ENABLED is false")
 
@@ -132,40 +410,590 @@ class PrintAgent:
         endpoint = (self.config.erp_endpoints or {})[endpoint_key]
         headers = self._build_erp_headers()
 
+        # Add correlation ID and idempotency key for traceability
+        correlation_id = (
+            job.get("correlation_id")
+            or job.get("correlationId")
+            or str(uuid.uuid4())
+        )
+        idempotency_key = (
+            job.get("idempotency_key")
+            or job.get("idempotencyKey")
+            or job.get("id")  # Fallback to job ID
+            or str(uuid.uuid4())
+        )
+        headers["X-Correlation-Id"] = correlation_id
+        headers["Idempotency-Key"] = idempotency_key
+
         # Never trust ERP URL/auth in cloud payload; only local endpoint config is used.
         payload = job.get("erp_payload")
         if payload is None:
             payload = job.get("payload")
 
-        attempts = self.config.erp_retry_attempts + 1
-        for attempt in range(1, attempts + 1):
+        # Use advanced retry settings if configured, otherwise fall back to simple retry
+        max_attempts = self.config.erp_retry_max_attempts
+        if self.config.erp_retry_attempts > 0:
+            max_attempts = max(max_attempts, self.config.erp_retry_attempts + 1)
+
+        retryable_http_statuses = {408, 429}
+        for attempt in range(1, max_attempts + 1):
             try:
                 response = requests.request(
                     method=endpoint.method,
                     url=endpoint.url,
                     headers=headers,
                     json=payload if isinstance(payload, (dict, list)) else {"payload": payload},
-                    timeout=endpoint.timeout_seconds,
+                    timeout=min(endpoint.timeout_seconds, self.config.erp_timeout_max_seconds),
                 )
+                status = response.status_code
+                is_retryable_http = (status in retryable_http_statuses) or (500 <= status <= 599)
+
+                if is_retryable_http and attempt < max_attempts:
+                    backoff_seconds = min(
+                        self.config.erp_retry_backoff_base_seconds * (2 ** (attempt - 1)),
+                        self.config.erp_retry_backoff_max_seconds,
+                    )
+                    sleep_seconds = backoff_seconds + random.uniform(0, self.config.erp_retry_jitter_seconds)
+                    logging.warning(
+                        "ERP request retryable HTTP status=%s job=%s endpoint=%s attempt=%d/%d sleeping=%.2fs",
+                        status,
+                        job.get("id"),
+                        endpoint_key,
+                        attempt,
+                        max_attempts,
+                        sleep_seconds,
+                    )
+                    time.sleep(sleep_seconds)
+                    continue
+
+                # Non-retryable 4xx (or final attempt for retryable codes)
+                if 400 <= status <= 499 and status not in retryable_http_statuses:
+                    logging.error("ERP request non-retryable HTTP status=%s job=%s endpoint=%s",
+                                 status, job.get("id"), endpoint_key)
+
                 response.raise_for_status()
-                logging.info("ERP request sent for job=%s endpoint=%s", job.get("id"), endpoint_key)
-                return
-            except requests.RequestException as exc:
-                if attempt >= attempts:
+                logging.info("ERP request succeeded job=%s endpoint=%s correlation_id=%s",
+                           job.get("id"), endpoint_key, correlation_id)
+                return {
+                    "status_code": status,
+                    "correlation_id": correlation_id,
+                    "idempotency_key": idempotency_key,
+                    "body": response.text,
+                }
+
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if attempt >= max_attempts:
                     raise Exception(
-                        f"ERP request failed after {attempts} attempt(s): {exc}"
+                        f"ERP request failed after {max_attempts} attempt(s): {exc}"
                     ) from exc
-                sleep_seconds = self.config.erp_retry_backoff_seconds * attempt
+                backoff_seconds = min(
+                    self.config.erp_retry_backoff_base_seconds * (2 ** (attempt - 1)),
+                    self.config.erp_retry_backoff_max_seconds,
+                )
+                sleep_seconds = backoff_seconds + random.uniform(0, self.config.erp_retry_jitter_seconds)
                 logging.warning(
-                    "ERP request failed for job=%s endpoint=%s attempt=%d/%d; retrying in %.2fs: %s",
+                    "ERP request network error job=%s endpoint=%s attempt=%d/%d; retrying in %.2fs: %s",
                     job.get("id"),
                     endpoint_key,
                     attempt,
-                    attempts,
+                    max_attempts,
                     sleep_seconds,
                     exc,
                 )
                 time.sleep(sleep_seconds)
+
+    def _send_erp_http_request(
+        self,
+        endpoint_key: str,
+        payload: Any,
+        correlation_id: str,
+        idempotency_key: str,
+    ) -> Dict[str, Any]:
+        """Generic HTTP sender for ERP endpoints (reusable by both print and ERP-agent paths).
+
+        Args:
+            endpoint_key: Key from ERP_ENDPOINTS_JSON whitelist
+            payload: Request payload (dict, list, or other)
+            correlation_id: Correlation ID for tracing
+            idempotency_key: Idempotency key for safe retries
+
+        Returns:
+            Dict with status_code, body, correlation_id, idempotency_key
+
+        Raises:
+            Exception: After all retry attempts exhausted
+        """
+        if not self.config.erp_enabled:
+            raise ValueError("ERP request failed but ERP_ENABLED is false")
+
+        if endpoint_key not in (self.config.erp_endpoints or {}):
+            raise ValueError(
+                f"ERP endpoint key '{endpoint_key}' is not configured on this workstation"
+            )
+
+        endpoint = (self.config.erp_endpoints or {})[endpoint_key]
+        headers = self._build_erp_headers()
+        headers["X-Correlation-Id"] = correlation_id
+        headers["Idempotency-Key"] = idempotency_key
+
+        # Use advanced retry settings if configured, otherwise fall back to simple retry
+        max_attempts = self.config.erp_retry_max_attempts
+        if self.config.erp_retry_attempts > 0:
+            max_attempts = max(max_attempts, self.config.erp_retry_attempts + 1)
+
+        retryable_http_statuses = {408, 429}
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Log the outgoing request details
+                logging.info(
+                    "[ERP-AGENT] Sending ERP request: method=%s url=%s correlation_id=%s idempotency_key=%s",
+                    endpoint.method,
+                    endpoint.url,
+                    correlation_id,
+                    idempotency_key,
+                )
+                # Log payload (sanitized)
+                if isinstance(payload, dict):
+                    sanitized_payload = {k: v for k, v in payload.items() if "password" not in k.lower() and "token" not in k.lower()}
+                    logging.info("[ERP-AGENT] Request payload: %s", json.dumps(sanitized_payload, ensure_ascii=False))
+                else:
+                    logging.info("[ERP-AGENT] Request payload: %s", str(payload)[:500])
+
+                # Always send JSON BODY (even for GET) - 1C requires this for ReadJSON()
+                request_kwargs = {
+                    "method": endpoint.method,
+                    "url": endpoint.url,
+                    "headers": {
+                        **headers,
+                        "Content-Type": "application/json",
+                    },
+                    "timeout": min(endpoint.timeout_seconds, self.config.erp_timeout_max_seconds),
+                }
+
+                try:
+                    json.dumps(payload)
+                except Exception as exc:
+                    raise ValueError(f"Invalid JSON payload: {exc}") from exc
+
+                if isinstance(payload, (dict, list)):
+                    request_kwargs["data"] = json.dumps(payload, ensure_ascii=False)
+                else:
+                    request_kwargs["data"] = json.dumps({"value": payload}, ensure_ascii=False)
+
+                logging.info("[ERP-AGENT] Final request body: %s", request_kwargs["data"])
+
+                response = requests.request(**request_kwargs)
+                status = response.status_code
+                is_retryable_http = (status in retryable_http_statuses) or (500 <= status <= 599)
+
+                # Log response details
+                logging.info(
+                    "[ERP-AGENT] ERP response: status=%s correlation_id=%s response_preview=%s",
+                    status,
+                    correlation_id,
+                    response.text[:200] if response.text else "(empty)",
+                )
+
+                if is_retryable_http and attempt < max_attempts:
+                    backoff_seconds = min(
+                        self.config.erp_retry_backoff_base_seconds * (2 ** (attempt - 1)),
+                        self.config.erp_retry_backoff_max_seconds,
+                    )
+                    sleep_seconds = backoff_seconds + random.uniform(0, self.config.erp_retry_jitter_seconds)
+                    logging.warning(
+                        "[ERP-AGENT] Retryable HTTP status=%s endpoint=%s attempt=%d/%d sleeping=%.2fs",
+                        status,
+                        endpoint_key,
+                        attempt,
+                        max_attempts,
+                        sleep_seconds,
+                    )
+                    time.sleep(sleep_seconds)
+                    continue
+
+                # Non-retryable 4xx (or final attempt for retryable codes)
+                if 400 <= status <= 499 and status not in retryable_http_statuses:
+                    logging.error("[ERP-AGENT] Non-retryable HTTP status=%s endpoint=%s",
+                                 status, endpoint_key)
+
+                response.raise_for_status()
+                logging.info("[ERP-AGENT] ERP request succeeded endpoint=%s correlation_id=%s",
+                           endpoint_key, correlation_id)
+                return {
+                    "status_code": status,
+                    "correlation_id": correlation_id,
+                    "idempotency_key": idempotency_key,
+                    "body": response.text,
+                }
+
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if attempt >= max_attempts:
+                    logging.error(
+                        "[ERP-AGENT] ERP request failed after %d attempts: method=%s url=%s correlation_id=%s error=%s",
+                        max_attempts,
+                        endpoint.method,
+                        endpoint.url,
+                        correlation_id,
+                        exc,
+                    )
+                    raise Exception(
+                        f"ERP request failed after {max_attempts} attempt(s): {exc}"
+                    ) from exc
+                backoff_seconds = min(
+                    self.config.erp_retry_backoff_base_seconds * (2 ** (attempt - 1)),
+                    self.config.erp_retry_backoff_max_seconds,
+                )
+                sleep_seconds = backoff_seconds + random.uniform(0, self.config.erp_retry_jitter_seconds)
+                logging.warning(
+                    "[ERP-AGENT] Network error endpoint=%s attempt=%d/%d; retrying in %.2fs: method=%s url=%s error=%s",
+                    endpoint_key,
+                    attempt,
+                    max_attempts,
+                    sleep_seconds,
+                    endpoint.method,
+                    endpoint.url,
+                    exc,
+                )
+                time.sleep(sleep_seconds)
+
+    def _process_erp_box_fetch(self, request: GenericErpRequest, client: ErpAgentClient) -> bool:
+        """Process a single ERP box fetch request.
+
+        Args:
+            request: Generic ERP request with business_type='erp_box_fetch'
+            client: ErpAgentClient for callbacks
+
+        Returns:
+            True if successful, False otherwise
+        """
+        logging.info("[ERP-AGENT] Processing business_type=erp_box_fetch request_id=%s invoice_id=%s quantity=%s",
+                   request.request_id, request.invoice_id, request.quantity)
+
+        # Generate correlation ID and idempotency key
+        correlation_id = str(uuid.uuid4())
+        idempotency_key = request.request_id
+
+        # Build ERP payload from request_payload (sent by Supabase edge function)
+        base_payload = request.request_payload if isinstance(request.request_payload, dict) else {}
+
+        # Normalize timestamp to 1C-expected format (NO milliseconds - ISO 8601 basic)
+        # 1C ReadJSON() is strict: "2025-10-19T10:00:00Z" works, "2026-03-24T14:24:03.158Z" fails
+        incoming_timestamp = base_payload.get("timestamp")
+        if incoming_timestamp:
+            # Strip milliseconds if present (e.g., "2026-03-24T14:24:03.158Z" → "2026-03-24T14:24:03Z")
+            normalized_timestamp = re.sub(r'\.\d+Z', 'Z', incoming_timestamp)
+        else:
+            normalized_timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        erp_payload = {
+            "message_id": base_payload.get("message_id") or request.invoice_message_id or request.request_id,
+            "client_id": base_payload.get("client_id"),
+            "requested_by": base_payload.get("requested_by"),
+            "timestamp": normalized_timestamp,
+            # TODO: HARDCODED FOR TESTING - REMOVE IN PRODUCTION
+            "warehouse_id": "000093",  # base_payload.get("warehouse_id"),
+            "quantity": base_payload.get("quantity") or request.quantity,
+        }
+
+        # Validate required fields (1C rejects empty or missing fields)
+        required_fields = ["client_id", "warehouse_id", "message_id", "requested_by"]
+
+        for field in required_fields:
+            if not erp_payload.get(field):
+                raise ValueError(
+                    f"ERP request failed: required field '{field}' is empty or missing. "
+                    f"erp_payload={erp_payload}"
+                )
+
+        # Type safety for quantity
+        if not isinstance(erp_payload["quantity"], int):
+            raise ValueError(f"quantity must be integer, got {type(erp_payload['quantity'])}")
+
+        # Debug logging - ERP BOX FETCH REQUEST
+        logging.info("=" * 60)
+        logging.info("[ERP-AGENT] === BOX FETCH REQUEST TO 1C ===")
+        logging.info("[ERP-AGENT] endpoint_key: erp_box_fetch")
+        logging.info("[ERP-AGENT] request_id: %s", request.request_id)
+        logging.info("[ERP-AGENT] correlation_id: %s", correlation_id)
+        logging.info("[ERP-AGENT] PAYLOAD: %s", json.dumps(erp_payload, ensure_ascii=False))
+        logging.info("=" * 60)
+
+        try:
+            # Call local ERP endpoint
+            response = self._send_erp_http_request(
+                endpoint_key="erp_box_fetch",
+                payload=erp_payload,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+            )
+
+            # Parse and normalize ERP response
+            try:
+                # 1C may return JSON with UTF-8 BOM - strip it before parsing
+                body = response["body"]
+                if body.startswith('\ufeff'):
+                    logging.debug("[ERP-AGENT] Stripping UTF-8 BOM from 1C response")
+                    body = body[1:]  # Strip BOM
+                response_body = json.loads(body, strict=False)
+            except json.JSONDecodeError as exc:
+                logging.error("[ERP-AGENT] JSON decode error: %s, body=%s", exc, response["body"][:200])
+                response_body = {"raw": response["body"]}
+
+            # Validate ERP response format
+            if not isinstance(response_body, dict):
+                raise ValueError(f"ERP response is not a dict: {type(response_body)}")
+
+            if response_body.get("status") != "success":
+                raise ValueError(f"ERP returned status: {response_body.get('status')}")
+
+            boxes = response_body.get("boxes")
+            if not isinstance(boxes, list):
+                raise ValueError(f"ERP boxes is not a list: {type(boxes)}")
+
+            # Normalize boxes to expected format
+            normalized_boxes = []
+            for box in boxes:
+                if not isinstance(box, dict):
+                    continue
+                normalized_boxes.append({
+                    "box_id": str(box.get("box_id", "")),
+                    "sscc": box.get("sscc"),
+                    "dm_code": box.get("dm_code"),
+                })
+
+            # Log 1C response
+            logging.info("=" * 60)
+            logging.info("[ERP-AGENT] === BOX FETCH RESPONSE FROM 1C ===")
+            logging.info("[ERP-AGENT] request_id: %s", request.request_id)
+            logging.info("[ERP-AGENT] status: success")
+            logging.info("[ERP-AGENT] boxes_count: %d", len(normalized_boxes))
+            logging.info("[ERP-AGENT] boxes: %s", json.dumps(normalized_boxes, ensure_ascii=False))
+            logging.info("=" * 60)
+            logging.info("")
+
+            # Callback success
+            client.post_success(request.request_id, normalized_boxes)
+            return True
+
+        except Exception as exc:
+            error_msg = str(exc)
+            logging.error("[ERP-AGENT] Failed request_id=%s: %s", request.request_id, error_msg)
+
+            # Callback failure
+            try:
+                client.post_failure(request.request_id, error_msg)
+            except Exception as callback_exc:
+                logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
+                            request.request_id, callback_exc)
+
+            return False
+
+    def _route_erp_request(self, request: GenericErpRequest, client: ErpAgentClient) -> bool:
+        """Route ERP request to appropriate handler based on business_type.
+
+        Args:
+            request: Generic ERP request
+            client: ErpAgentClient for callbacks
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Log incoming request for debugging
+        logging.info("")
+        logging.info(">>> [ERP-AGENT] INCOMING REQUEST ROUTER <<<")
+        logging.info("    business_type: %s", request.business_type)
+        logging.info("    request_id: %s", request.request_id)
+        logging.info("    endpoint_key: %s", request.endpoint_key)
+        logging.info("    attempts: %d/%d", request.attempts, request.max_attempts)
+        logging.info("    request_payload: %s", json.dumps(request.request_payload, ensure_ascii=False)[:500])
+        logging.info("")
+
+        if request.business_type == "erp_box_fetch":
+            return self._process_erp_box_fetch(request, client)
+        elif request.business_type == "completion_event":
+            return self._process_completion_event(request, client)
+        else:
+            logging.error("[ERP-AGENT] Unknown business_type=%s request_id=%s",
+                         request.business_type, request.request_id)
+            try:
+                client.post_failure(request.request_id, f"Unknown business_type: {request.business_type}")
+            except Exception as callback_exc:
+                logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
+                            request.request_id, callback_exc)
+            return False
+
+    def _process_completion_event(self, request: GenericErpRequest, client: ErpAgentClient) -> bool:
+        """Process completion event request to 1C.
+
+        IMPORTANT: request_payload is passed through exactly as received from Supabase.
+        No timestamp normalization or field modifications for completion events.
+
+        Args:
+            request: Generic ERP request with business_type='completion_event'
+            client: ErpAgentClient for callbacks
+
+        Returns:
+            True if successful, False otherwise
+        """
+        logging.info("[ERP-AGENT] Processing business_type=completion_event request_id=%s message_id=%s",
+                   request.request_id, request.request_payload.get("message_id") if request.request_payload else "N/A")
+
+        # Validate required fields exist in request_payload
+        required_fields = ["message_id", "invoice_id", "client_id", "timestamp",
+                          "operator_id", "warehouse_id", "boxes", "shortages", "summary"]
+
+        if not request.request_payload:
+            error_msg = "ERP request failed: request_payload is missing or empty"
+            logging.error("[ERP-AGENT] %s request_id=%s", error_msg, request.request_id)
+            try:
+                client.post_completion_failure(request.request_id, error_msg)
+            except Exception as callback_exc:
+                logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
+                            request.request_id, callback_exc)
+            return False
+
+        for field in required_fields:
+            if field not in request.request_payload:
+                error_msg = f"ERP request failed: required field '{field}' is missing from request_payload"
+                logging.error("[ERP-AGENT] %s request_id=%s", error_msg, request.request_id)
+                try:
+                    client.post_completion_failure(request.request_id, error_msg)
+                except Exception as callback_exc:
+                    logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
+                                request.request_id, callback_exc)
+                return False
+
+        # Generate correlation ID and idempotency key
+        correlation_id = str(uuid.uuid4())
+        idempotency_key = request.request_id
+
+        # Use request_payload exactly as received (no modifications)
+        erp_payload = request.request_payload
+
+        # Debug logging - COMPLETION EVENT REQUEST
+        logging.info("=" * 60)
+        logging.info("[ERP-AGENT] === COMPLETION EVENT REQUEST TO 1C ===")
+        logging.info("[ERP-AGENT] endpoint_key: completion_event")
+        logging.info("[ERP-AGENT] request_id: %s", request.request_id)
+        logging.info("[ERP-AGENT] correlation_id: %s", correlation_id)
+        logging.info("[ERP-AGENT] PAYLOAD: %s", json.dumps(erp_payload, ensure_ascii=False))
+        logging.info("=" * 60)
+
+        try:
+            # Call completion_event endpoint
+            response = self._send_erp_http_request(
+                endpoint_key="completion_event",
+                payload=erp_payload,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+            )
+
+            # Parse and normalize ERP response
+            try:
+                # 1C may return JSON with UTF-8 BOM - strip it before parsing
+                body = response["body"]
+                if body.startswith('\ufeff'):
+                    logging.debug("[ERP-AGENT] Stripping UTF-8 BOM from 1C response")
+                    body = body[1:]  # Strip BOM
+                response_body = json.loads(body, strict=False)
+            except json.JSONDecodeError as exc:
+                logging.error("[ERP-AGENT] JSON decode error: %s, body=%s", exc, response["body"][:200])
+                response_body = {"raw": response["body"]}
+
+            # Validate ERP response format
+            if not isinstance(response_body, dict):
+                raise ValueError(f"ERP response is not a dict: {type(response_body)}")
+
+            if response_body.get("status") != "success":
+                raise ValueError(f"ERP returned status: {response_body.get('status')}")
+
+            # Log 1C response
+            logging.info("=" * 60)
+            logging.info("[ERP-AGENT] === COMPLETION EVENT RESPONSE FROM 1C ===")
+            logging.info("[ERP-AGENT] request_id: %s", request.request_id)
+            logging.info("[ERP-AGENT] status: success")
+            logging.info("[ERP-AGENT] response: %s", json.dumps(response_body, ensure_ascii=False))
+            logging.info("=" * 60)
+            logging.info("")
+
+            # Callback success with ERP response
+            client.post_completion_success(request.request_id, response_body)
+            return True
+
+        except Exception as exc:
+            error_msg = str(exc)
+            logging.error("[ERP-AGENT] Failed request_id=%s: %s", request.request_id, error_msg)
+
+            # Callback failure
+            try:
+                client.post_completion_failure(request.request_id, error_msg)
+            except Exception as callback_exc:
+                logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
+                            request.request_id, callback_exc)
+
+            return False
+
+    def run_erp_forever(self) -> None:
+        """Run ERP-agent polling loop (separate from print loop)."""
+        if not self.config.erp_agent_enabled:
+            logging.warning("[ERP-AGENT] ERP-agent loop disabled (ERP_AGENT_ENABLED=false)")
+            return
+
+        if not self.config.erp_agent_url:
+            logging.error("[ERP-AGENT] ERP_AGENT_URL not configured, disabling ERP-agent loop")
+            return
+
+        logging.info("[ERP-AGENT] Starting ERP-agent loop (poll_interval=%s, max_concurrent=%s)",
+                   self.config.erp_agent_poll_interval_seconds,
+                   self.config.erp_agent_max_concurrent_requests)
+
+        client = ErpAgentClient(
+            url=self.config.erp_agent_url,
+            api_key=self.config.erp_agent_api_key or self.config.print_agent_api_key,
+            workstation_id=self.config.workstation_id,
+        )
+
+        with ThreadPoolExecutor(max_workers=self.config.erp_agent_max_concurrent_requests,
+                               thread_name_prefix="ErpAgentWorker") as executor:
+            while not self.shutdown_requested:
+                try:
+                    requests = client.poll_requests(limit=self.config.erp_agent_max_concurrent_requests)
+                    if not requests:
+                        # Sleep with interrupt check
+                        for _ in range(int(self.config.erp_agent_poll_interval_seconds * 10)):
+                            if self.shutdown_requested:
+                                break
+                            time.sleep(0.1)
+                        if self.shutdown_requested:
+                            break
+                        continue
+
+                    logging.info("[ERP-AGENT] Processing %d requests", len(requests))
+
+                    # Submit all requests to thread pool (routed by business_type)
+                    futures = {
+                        executor.submit(self._route_erp_request, req, client): req
+                        for req in requests
+                    }
+
+                    # Wait for all requests to complete
+                    for future in as_completed(futures, timeout=300):
+                        req = futures[future]
+                        try:
+                            result = future.result()
+                            if not result:
+                                logging.warning("[ERP-AGENT] Request %s failed during processing",
+                                              req.request_id)
+                        except Exception as exc:
+                            logging.exception("[ERP-AGENT] Unexpected error processing request %s: %s",
+                                            req.request_id, exc)
+
+                except Exception as exc:
+                    logging.exception("[ERP-AGENT] Loop error: %s", exc)
+                    if not self.shutdown_requested:
+                        time.sleep(self.config.erp_agent_poll_interval_seconds)
+
+        logging.info("[ERP-AGENT] ERP-agent loop stopped")
 
     def _setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
@@ -275,7 +1103,32 @@ class PrintAgent:
         else:
             logging.error("Unexpected poll response format: %s", type(body))
             return []
-        return jobs
+
+        # Defensive check: filter out jobs that have exceeded max_attempts
+        # This prevents infinite retry loops when backend doesn't properly filter them
+        filtered_jobs = []
+        for job in jobs:
+            try:
+                attempt = int(job.get("attempt", 0))
+                max_attempts = int(job.get("max_attempts", 3))
+                if attempt >= max_attempts:
+                    logging.warning(
+                        "Skipping job_id=%s that has exceeded max_attempts (attempt=%d, max_attempts=%d). "
+                        "Backend should have filtered this out - marking as failed.",
+                        job.get("id"), attempt, max_attempts
+                    )
+                    # Notify backend to mark as failed (defensive measure)
+                    try:
+                        self._mark_failed(job, f"Exceeded max_attempts ({attempt}/{max_attempts})")
+                    except Exception as exc:
+                        logging.error("Failed to mark job %s as failed: %s", job.get("id"), exc)
+                    continue
+                filtered_jobs.append(job)
+            except (ValueError, TypeError) as exc:
+                logging.error("Invalid job format for attempt/max_attempts check: %s", exc)
+                filtered_jobs.append(job)  # Include job anyway to avoid losing it
+
+        return filtered_jobs
 
     def _fetch_single_job(self) -> Optional[Dict[str, Any]]:
         """Fetch a single pending job (backwards compatible)."""
@@ -309,7 +1162,29 @@ class PrintAgent:
         else:
             logging.error("Unexpected poll response format: %s", type(body))
             return None
-        return jobs[0] if jobs else None
+
+        # Defensive check: filter out jobs that have exceeded max_attempts
+        for job in jobs:
+            try:
+                attempt = int(job.get("attempt", 0))
+                max_attempts = int(job.get("max_attempts", 3))
+                if attempt >= max_attempts:
+                    logging.warning(
+                        "Skipping job_id=%s that has exceeded max_attempts (attempt=%d, max_attempts=%d). "
+                        "Backend should have filtered this out - marking as failed.",
+                        job.get("id"), attempt, max_attempts
+                    )
+                    try:
+                        self._mark_failed(job, f"Exceeded max_attempts ({attempt}/{max_attempts})")
+                    except Exception as exc:
+                        logging.error("Failed to mark job %s as failed: %s", job.get("id"), exc)
+                    continue
+                # Return first valid job
+                return job
+            except (ValueError, TypeError) as exc:
+                logging.error("Invalid job format for attempt/max_attempts check: %s", exc)
+                return job  # Return job anyway to avoid losing it
+        return None
 
     def _send_to_printer(self, job: Dict[str, Any]) -> None:
         """Send ZPL data to printer with guaranteed socket cleanup."""
@@ -430,8 +1305,15 @@ class PrintAgent:
             return "retry_scheduled"
         return "failed"
 
-    def _mark_done(self, job: Dict[str, Any], duration_ms: Optional[int] = None) -> None:
+    def _mark_done(
+        self,
+        job: Dict[str, Any],
+        duration_ms: Optional[int] = None,
+        context_overrides: Optional[Dict[str, Any]] = None,
+    ) -> None:
         context = self._extract_job_context(job)
+        if context_overrides:
+            context.update(context_overrides)
         self._notify_print_service(
             job_id=job.get("id"),
             status="completed",
@@ -443,7 +1325,7 @@ class PrintAgent:
             business_type=context["business_type"],
             business_id=context["business_id"],
             correlation_id=context["correlation_id"],
-            response_code=200,
+            response_code=context.get("response_code", 200),
             retryable=False,
             error_code=None,
             transport_error_message=None,
@@ -477,142 +1359,6 @@ class PrintAgent:
             erp_body=context["erp_body"],
         )
 
-    def _execute_erp_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute an ERP connector request with retry/backoff behavior.
-
-        Retries are performed for:
-        - requests network errors
-        - request timeouts
-        - HTTP status 408, 429, and all 5xx responses
-
-        4xx responses other than 408/429 are returned immediately without retry.
-        """
-        erp_request = job.get("erp_request")
-        if not isinstance(erp_request, dict):
-            raise ValueError("job missing required dict field 'erp_request'")
-
-        method = str(erp_request.get("method", "POST")).upper()
-        url = erp_request.get("url")
-        if not isinstance(url, str) or not url.strip():
-            raise ValueError("erp_request.url must be a non-empty string")
-
-        request_headers = erp_request.get("headers") or {}
-        if not isinstance(request_headers, dict):
-            raise ValueError("erp_request.headers must be a dict when provided")
-
-        # Reuse the same correlation and idempotency values across all retries.
-        correlation_id = (
-            job.get("correlation_id")
-            or erp_request.get("correlation_id")
-            or str(uuid.uuid4())
-        )
-        idempotency_key = (
-            job.get("idempotency_key")
-            or erp_request.get("idempotency_key")
-            or str(uuid.uuid4())
-        )
-
-        headers = {str(k): str(v) for k, v in request_headers.items()}
-        headers["X-Correlation-Id"] = correlation_id
-        headers["Idempotency-Key"] = idempotency_key
-
-        timeout_override = (
-            job.get("timeout_seconds")
-            if job.get("timeout_seconds") is not None
-            else erp_request.get("timeout_seconds")
-        )
-        timeout_seconds = self.config.erp_http_timeout_seconds
-        if timeout_override is not None:
-            timeout_seconds = float(timeout_override)
-
-        # Connector-side cap: caller can reduce timeout but cannot exceed cap.
-        timeout_seconds = min(timeout_seconds, self.config.erp_timeout_max_seconds)
-        if timeout_seconds <= 0:
-            raise ValueError("ERP timeout_seconds must be > 0")
-
-        max_attempts = int(
-            job.get("max_attempts")
-            if job.get("max_attempts") is not None
-            else self.config.erp_retry_max_attempts
-        )
-        if max_attempts < 1:
-            raise ValueError("ERP max_attempts must be >= 1")
-
-        body = erp_request.get("body")
-        request_kwargs: Dict[str, Any] = {
-            "method": method,
-            "url": url,
-            "headers": headers,
-            "timeout": timeout_seconds,
-        }
-        if body is not None:
-            # Send request body exactly as received; no wrapper/transform envelope.
-            request_kwargs["json"] = body if isinstance(body, (dict, list)) else None
-            if request_kwargs["json"] is None:
-                request_kwargs.pop("json", None)
-                request_kwargs["data"] = body
-
-        retryable_http_statuses = {408, 429}
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = requests.request(**request_kwargs)
-                status = response.status_code
-                is_retryable_http = (status in retryable_http_statuses) or (500 <= status <= 599)
-
-                if is_retryable_http and attempt < max_attempts:
-                    backoff_seconds = min(
-                        self.config.erp_retry_backoff_base_seconds * (2 ** (attempt - 1)),
-                        self.config.erp_retry_backoff_max_seconds,
-                    )
-                    sleep_seconds = backoff_seconds + random.uniform(0, self.config.erp_retry_jitter_seconds)
-                    logging.warning(
-                        "ERP request retryable HTTP status=%s attempt=%d/%d sleeping=%.2fs",
-                        status,
-                        attempt,
-                        max_attempts,
-                        sleep_seconds,
-                    )
-                    time.sleep(sleep_seconds)
-                    continue
-
-                # Non-retryable 4xx (or final attempt for retryable codes).
-                if 400 <= status <= 499 and status not in retryable_http_statuses:
-                    return {
-                        "status_code": status,
-                        "headers": dict(response.headers),
-                        "body": response.text,
-                        "correlation_id": correlation_id,
-                        "idempotency_key": idempotency_key,
-                    }
-
-                response.raise_for_status()
-                return {
-                    "status_code": status,
-                    "headers": dict(response.headers),
-                    "body": response.text,
-                    "correlation_id": correlation_id,
-                    "idempotency_key": idempotency_key,
-                }
-            except (requests.Timeout, requests.ConnectionError) as exc:
-                if attempt >= max_attempts:
-                    raise
-                backoff_seconds = min(
-                    self.config.erp_retry_backoff_base_seconds * (2 ** (attempt - 1)),
-                    self.config.erp_retry_backoff_max_seconds,
-                )
-                sleep_seconds = backoff_seconds + random.uniform(0, self.config.erp_retry_jitter_seconds)
-                logging.warning(
-                    "ERP request network/timeout failure attempt=%d/%d error=%s sleeping=%.2fs",
-                    attempt,
-                    max_attempts,
-                    exc,
-                    sleep_seconds,
-                )
-                time.sleep(sleep_seconds)
-            except requests.HTTPError:
-                # HTTPError here means final-attempt retryable HTTP failure.
-                raise
-
     def _notify_print_service(
         self,
         job_id: Optional[str],
@@ -632,7 +1378,6 @@ class PrintAgent:
         duration_ms: Optional[int] = None,
         erp_body: Any = None,
     ) -> None:
-        job_id = job.get("id")
         payload = {
             # Compatibility fields
             "jobId": job_id,
@@ -695,17 +1440,6 @@ class PrintAgent:
         except Exception as exc:
             logging.error("Unexpected error sending callback for job %s: %s", job_id, exc)
 
-    def _execute_erp_job(self, job: Dict[str, Any]) -> None:
-        """Execute an ERP channel job."""
-        erp_request = job["erp_request"]
-        if not isinstance(erp_request, dict):
-            raise ValueError("job field 'erp_request' must be a dict")
-
-        logging.info("Processing ERP request for job=%s", job.get("id"))
-        # Placeholder for ERP dispatch implementation.
-        # Keeping this method isolated allows future ERP adapters without
-        # changing process_job() flow.
-
     def process_job(self, job: Dict[str, Any]) -> bool:
         """Process a single print job (thread-safe)."""
         job_id = job.get("id")
@@ -716,9 +1450,15 @@ class PrintAgent:
         logging.info("[%s] processing job=%s printer_ip=%s printer_port=%s",
                      thread_id, job_id, job.get("printer_ip"), job.get("printer_port"))
         started_at = time.monotonic()
+        success_context: Optional[Dict[str, Any]] = None
         try:
             if self._is_erp_job(job):
-                self._send_to_erp(job)
+                erp_result = self._send_to_erp(job)
+                success_context = {
+                    "correlation_id": erp_result.get("correlation_id"),
+                    "erp_body": erp_result.get("body"),
+                    "response_code": erp_result.get("status_code", 200),
+                }
             else:
                 self._send_to_printer(job)
         except Exception as exc:
@@ -729,7 +1469,7 @@ class PrintAgent:
 
         duration_ms = int((time.monotonic() - started_at) * 1000)
         try:
-            self._mark_done(job, duration_ms=duration_ms)
+            self._mark_done(job, duration_ms=duration_ms, context_overrides=success_context)
         except Exception as exc:
             logging.error(
                 "[%s] completion callback failed after successful print job=%s error=%s",
@@ -931,6 +1671,52 @@ def load_config() -> Config:
             f"ERP_RETRY_BACKOFF_SECONDS must be >= 0, got {erp_retry_backoff_seconds}"
         )
 
+    # Advanced ERP retry settings (optional)
+    erp_timeout_max_seconds = float(os.getenv("ERP_TIMEOUT_MAX_SECONDS", "30"))
+    if erp_timeout_max_seconds <= 0:
+        raise ValueError(
+            f"ERP_TIMEOUT_MAX_SECONDS must be > 0, got {erp_timeout_max_seconds}"
+        )
+
+    erp_retry_max_attempts = int(os.getenv("ERP_RETRY_MAX_ATTEMPTS", "3"))
+    if erp_retry_max_attempts < 1:
+        raise ValueError(
+            f"ERP_RETRY_MAX_ATTEMPTS must be >= 1, got {erp_retry_max_attempts}"
+        )
+
+    erp_retry_backoff_base_seconds = float(os.getenv("ERP_RETRY_BACKOFF_BASE_SECONDS", "1"))
+    if erp_retry_backoff_base_seconds < 0:
+        raise ValueError(
+            f"ERP_RETRY_BACKOFF_BASE_SECONDS must be >= 0, got {erp_retry_backoff_base_seconds}"
+        )
+
+    erp_retry_backoff_max_seconds = float(os.getenv("ERP_RETRY_BACKOFF_MAX_SECONDS", "60"))
+    if erp_retry_backoff_max_seconds < 0:
+        raise ValueError(
+            f"ERP_RETRY_BACKOFF_MAX_SECONDS must be >= 0, got {erp_retry_backoff_max_seconds}"
+        )
+
+    erp_retry_jitter_seconds = float(os.getenv("ERP_RETRY_JITTER_SECONDS", "1"))
+    if erp_retry_jitter_seconds < 0:
+        raise ValueError(
+            f"ERP_RETRY_JITTER_SECONDS must be >= 0, got {erp_retry_jitter_seconds}"
+        )
+
+    # ERP-agent specific settings
+    erp_agent_enabled = parse_bool_env("ERP_AGENT_ENABLED", default=False)
+    erp_agent_url = os.getenv("ERP_AGENT_URL", "").strip()
+    erp_agent_api_key = os.getenv("ERP_AGENT_API_KEY", "").strip() or ""
+    erp_agent_poll_interval = float(os.getenv("ERP_AGENT_POLL_INTERVAL_SECONDS", "2"))
+    if erp_agent_poll_interval < 0:
+        raise ValueError(
+            f"ERP_AGENT_POLL_INTERVAL_SECONDS must be >= 0, got {erp_agent_poll_interval}"
+        )
+    erp_agent_max_concurrent = int(os.getenv("ERP_AGENT_MAX_CONCURRENT_REQUESTS", "2"))
+    if erp_agent_max_concurrent < 1:
+        raise ValueError(
+            f"ERP_AGENT_MAX_CONCURRENT_REQUESTS must be >= 1, got {erp_agent_max_concurrent}"
+        )
+
     config = Config(
         print_agent_url=require_env("PRINT_AGENT_CALLBACK_URL"),
         print_agent_api_key=require_env("PRINT_AGENT_API_KEY"),
@@ -949,6 +1735,16 @@ def load_config() -> Config:
         erp_retry_attempts=erp_retry_attempts,
         erp_retry_backoff_seconds=erp_retry_backoff_seconds,
         erp_default_timeout_seconds=erp_default_timeout_seconds,
+        erp_timeout_max_seconds=erp_timeout_max_seconds,
+        erp_retry_max_attempts=erp_retry_max_attempts,
+        erp_retry_backoff_base_seconds=erp_retry_backoff_base_seconds,
+        erp_retry_backoff_max_seconds=erp_retry_backoff_max_seconds,
+        erp_retry_jitter_seconds=erp_retry_jitter_seconds,
+        erp_agent_enabled=erp_agent_enabled,
+        erp_agent_url=erp_agent_url,
+        erp_agent_api_key=erp_agent_api_key,
+        erp_agent_poll_interval_seconds=erp_agent_poll_interval,
+        erp_agent_max_concurrent_requests=erp_agent_max_concurrent,
     )
     pprint.pprint(config)
     return config
@@ -1149,6 +1945,15 @@ def main() -> None:
         # Load config and start agent
         config = load_config()
         agent = PrintAgent(config)
+
+        # Start ERP-agent loop in background thread if enabled
+        erp_thread = None
+        if config.erp_agent_enabled:
+            erp_thread = threading.Thread(target=agent.run_erp_forever, daemon=True, name="ErpAgentLoop")
+            erp_thread.start()
+            logging.info("Started ERP-agent loop in background thread")
+
+        # Run print loop in main thread
         agent.run_forever()
     except KeyboardInterrupt:
         logging.info("Interrupted by user")
