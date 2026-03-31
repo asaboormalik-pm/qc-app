@@ -673,52 +673,27 @@ class PrintAgent:
         correlation_id = str(uuid.uuid4())
         idempotency_key = request.request_id
 
-        # Build ERP payload from request_payload (sent by Supabase edge function)
-        base_payload = request.request_payload if isinstance(request.request_payload, dict) else {}
-
-        # Normalize timestamp to 1C-expected format (NO milliseconds - ISO 8601 basic)
-        # 1C ReadJSON() is strict: "2025-10-19T10:00:00Z" works, "2026-03-24T14:24:03.158Z" fails
-        incoming_timestamp = base_payload.get("timestamp")
-        if incoming_timestamp:
-            # Strip milliseconds if present (e.g., "2026-03-24T14:24:03.158Z" → "2026-03-24T14:24:03Z")
-            normalized_timestamp = re.sub(r'\.\d+Z', 'Z', incoming_timestamp)
-        else:
-            normalized_timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-        erp_payload = {
-            "message_id": base_payload.get("message_id") or request.invoice_message_id or request.request_id,
-            "client_id": base_payload.get("client_id"),
-            "requested_by": base_payload.get("requested_by"),
-            "timestamp": normalized_timestamp,
-            # TODO: HARDCODED FOR TESTING - REMOVE IN PRODUCTION
-            "warehouse_id": "000093",  # base_payload.get("warehouse_id"),
-            "quantity": base_payload.get("quantity") or request.quantity,
-        }
-
-        # Validate required fields (1C rejects empty or missing fields)
-        required_fields = ["client_id", "warehouse_id", "message_id", "requested_by"]
-
-        for field in required_fields:
-            if not erp_payload.get(field):
+        try:
+            if request.request_payload is None:
+                raise ValueError("ERP request failed: request_payload is missing or empty")
+            if not isinstance(request.request_payload, dict):
                 raise ValueError(
-                    f"ERP request failed: required field '{field}' is empty or missing. "
-                    f"erp_payload={erp_payload}"
+                    f"ERP request failed: request_payload must be a JSON object, got {type(request.request_payload)}"
                 )
 
-        # Type safety for quantity
-        if not isinstance(erp_payload["quantity"], int):
-            raise ValueError(f"quantity must be integer, got {type(erp_payload['quantity'])}")
+            # Forward the request payload with only the current fixed-warehouse override.
+            erp_payload = dict(request.request_payload)
+            erp_payload["warehouse_id"] = "000093"
 
-        # Debug logging - ERP BOX FETCH REQUEST
-        logging.info("=" * 60)
-        logging.info("[ERP-AGENT] === BOX FETCH REQUEST TO 1C ===")
-        logging.info("[ERP-AGENT] endpoint_key: erp_box_fetch")
-        logging.info("[ERP-AGENT] request_id: %s", request.request_id)
-        logging.info("[ERP-AGENT] correlation_id: %s", correlation_id)
-        logging.info("[ERP-AGENT] PAYLOAD: %s", json.dumps(erp_payload, ensure_ascii=False))
-        logging.info("=" * 60)
+            # Debug logging - ERP BOX FETCH REQUEST
+            logging.info("=" * 60)
+            logging.info("[ERP-AGENT] === BOX FETCH REQUEST TO 1C ===")
+            logging.info("[ERP-AGENT] endpoint_key: erp_box_fetch")
+            logging.info("[ERP-AGENT] request_id: %s", request.request_id)
+            logging.info("[ERP-AGENT] correlation_id: %s", correlation_id)
+            logging.info("[ERP-AGENT] PAYLOAD: %s", json.dumps(erp_payload, ensure_ascii=False))
+            logging.info("=" * 60)
 
-        try:
             # Call local ERP endpoint
             response = self._send_erp_http_request(
                 endpoint_key="erp_box_fetch",
