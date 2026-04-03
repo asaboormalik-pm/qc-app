@@ -44,9 +44,28 @@ import requests
 try:
     import tkinter as tk
     from tkinter import ttk
+    from tkinter import messagebox
     TKINTER_AVAILABLE = True
 except ImportError:
     TKINTER_AVAILABLE = False
+
+
+def show_error_message(title: str, message: str) -> None:
+    """Show error message in GUI message box (if available) or console."""
+    if TKINTER_AVAILABLE:
+        try:
+            # Create a hidden root window for the message box
+            root = tk.Tk()
+            root.withdraw()  # Hide the main window
+            messagebox.showerror(title, message)
+            root.destroy()
+        except Exception:
+            # If message box fails, fall back to console
+            print(f"ERROR: {title}")
+            print(f"  {message}")
+    else:
+        print(f"ERROR: {title}")
+        print(f"  {message}")
 
 
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
@@ -2632,15 +2651,10 @@ def main() -> None:
 
         # Check if tkinter is available
         if not TKINTER_AVAILABLE:
-            print("ERROR: Tkinter GUI is not available!")
-            print("The setup wizard requires Tkinter, but it's not installed.")
-            print()
-            print("Possible solutions:")
-            print("1. Install python3-tk package")
-            print("2. Use: qc-print-agent.exe --setup (manual mode)")
-            print()
-            print("Press Enter to exit...")
-            input()
+            show_error_message(
+                "Setup Wizard Error",
+                "Tkinter GUI is not available.\n\nThe setup wizard requires Tkinter.\n\nPlease install python3-tk or contact support."
+            )
             sys.exit(1)
 
         try:
@@ -2649,19 +2663,18 @@ def main() -> None:
             wizard = SetupWizard(manager)
             wizard.run()
             # After setup completes, exit - user needs to restart the agent
-            print()
-            print("Setup complete! Please run the agent again to start processing jobs.")
-            print("For background mode, use: qc-print-agent.exe --daemon")
+            show_error_message(
+                "Setup Complete",
+                "Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.\n\nFor background mode, use: qc-print-agent.exe --daemon"
+            )
             sys.exit(0)
         except Exception as exc:
-            print(f"Setup wizard error: {exc}")
             import traceback
-            traceback.print_exc()
-            print()
-            print("Please run: qc-print-agent.exe --setup")
-            print()
-            print("Press Enter to exit...")
-            input()
+            error_details = f"{exc}\n\n{traceback.format_exc()}"
+            show_error_message(
+                "Setup Wizard Error",
+                f"Failed to launch setup wizard:\n\n{error_details}\n\nPlease try again or contact support."
+            )
             sys.exit(1)
 
     # Check for existing instance
