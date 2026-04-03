@@ -2621,6 +2621,28 @@ def main() -> None:
         print("This appears to be your first time running the agent.")
         print("Launching setup wizard to pair with your warehouse...")
         print()
+
+        # Debug logging
+        state = store.load_state()
+        print(f"DEBUG: is_paired={store.is_paired()}")
+        print(f"DEBUG: Paired state: {state.get('is_paired')}")
+        print(f"DEBUG: Workstation ID: {store.get_workstation_id()}")
+        print(f"DEBUG: Tkinter available: {TKINTER_AVAILABLE}")
+        print()
+
+        # Check if tkinter is available
+        if not TKINTER_AVAILABLE:
+            print("ERROR: Tkinter GUI is not available!")
+            print("The setup wizard requires Tkinter, but it's not installed.")
+            print()
+            print("Possible solutions:")
+            print("1. Install python3-tk package")
+            print("2. Use: qc-print-agent.exe --setup (manual mode)")
+            print()
+            print("Press Enter to exit...")
+            input()
+            sys.exit(1)
+
         try:
             config = load_config()
             manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
@@ -2633,6 +2655,8 @@ def main() -> None:
             sys.exit(0)
         except Exception as exc:
             print(f"Setup wizard error: {exc}")
+            import traceback
+            traceback.print_exc()
             print()
             print("Please run: qc-print-agent.exe --setup")
             print()

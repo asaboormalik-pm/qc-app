@@ -35,6 +35,11 @@ hiddenimports = [
     'keyring.backends.kwallet',
     'requests',
     'urllib3',
+    # Tkinter for setup wizard
+    'tkinter',
+    'tkinter.ttk',
+    'tkinter.messagebox',
+    'tkinter.simpledialog',
 ]
 
 # Data files to include (templates, configs, etc.)
