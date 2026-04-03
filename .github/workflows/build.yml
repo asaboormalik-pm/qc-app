@@ -27,7 +27,7 @@ jobs:
           python -m PyInstaller print_agent.spec --clean
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: qc-print-agent-windows
           path: dist/qc-print-agent.exe
@@ -63,7 +63,7 @@ jobs:
           zip -r "QC Print Agent.app.zip" "QC Print Agent.app"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: qc-print-agent-macos
           path: dist/QC Print Agent.app.zip
