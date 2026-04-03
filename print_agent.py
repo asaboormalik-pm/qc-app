@@ -126,6 +126,21 @@ class ErpAgentClient:
             "Content-Type": "application/json",
         }
 
+    @staticmethod
+    def _format_json_for_log(value: Any) -> str:
+        """Return a readable JSON-like string for logging without changing payloads."""
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return value
+            return json.dumps(parsed, indent=2, ensure_ascii=False)
+
+        try:
+            return json.dumps(value, indent=2, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+
     def poll_requests(self, limit: int) -> List[GenericErpRequest]:
         """Poll for pending ERP requests (supports multiple business types).
 
@@ -187,8 +202,12 @@ class ErpAgentClient:
                     continue
 
                 # Log incoming request with business_type for debugging
-                logging.info("[ERP-AGENT] INCOMING AGENT REQUEST business_type=%s request_id=%s: %s",
-                           business_type, req.get("id"), json.dumps(req, ensure_ascii=False))
+                logging.info(
+                    "[ERP-AGENT] INCOMING AGENT REQUEST business_type=%s request_id=%s:\n%s",
+                    business_type,
+                    req.get("id"),
+                    self._format_json_for_log(req),
+                )
 
                 # For backwards compatibility, support old box fetch format without business_type
                 if business_type not in ("erp_box_fetch", "completion_event"):
@@ -555,9 +574,15 @@ class PrintAgent:
                 # Log payload (sanitized)
                 if isinstance(payload, dict):
                     sanitized_payload = {k: v for k, v in payload.items() if "password" not in k.lower() and "token" not in k.lower()}
-                    logging.info("[ERP-AGENT] Request payload: %s", json.dumps(sanitized_payload, ensure_ascii=False))
+                    logging.info(
+                        "[ERP-AGENT] Request payload:\n%s",
+                        ErpAgentClient._format_json_for_log(sanitized_payload),
+                    )
                 else:
-                    logging.info("[ERP-AGENT] Request payload: %s", str(payload)[:500])
+                    payload_preview = ErpAgentClient._format_json_for_log(payload)
+                    if len(payload_preview) > 500:
+                        payload_preview = f"{payload_preview[:500]}..."
+                    logging.info("[ERP-AGENT] Request payload:\n%s", payload_preview)
 
                 # Always send JSON BODY (even for GET) - 1C requires this for ReadJSON()
                 request_kwargs = {
@@ -580,7 +605,10 @@ class PrintAgent:
                 else:
                     request_kwargs["data"] = json.dumps({"value": payload}, ensure_ascii=False)
 
-                logging.info("[ERP-AGENT] Final request body: %s", request_kwargs["data"])
+                logging.info(
+                    "[ERP-AGENT] Final request body:\n%s",
+                    ErpAgentClient._format_json_for_log(request_kwargs["data"]),
+                )
 
                 response = requests.request(**request_kwargs)
                 status = response.status_code
@@ -691,7 +719,10 @@ class PrintAgent:
             logging.info("[ERP-AGENT] endpoint_key: erp_box_fetch")
             logging.info("[ERP-AGENT] request_id: %s", request.request_id)
             logging.info("[ERP-AGENT] correlation_id: %s", correlation_id)
-            logging.info("[ERP-AGENT] PAYLOAD: %s", json.dumps(erp_payload, ensure_ascii=False))
+            logging.info(
+                "[ERP-AGENT] PAYLOAD:\n%s",
+                ErpAgentClient._format_json_for_log(erp_payload),
+            )
             logging.info("=" * 60)
 
             # Call local ERP endpoint
@@ -742,7 +773,10 @@ class PrintAgent:
             logging.info("[ERP-AGENT] request_id: %s", request.request_id)
             logging.info("[ERP-AGENT] status: success")
             logging.info("[ERP-AGENT] boxes_count: %d", len(normalized_boxes))
-            logging.info("[ERP-AGENT] boxes: %s", json.dumps(normalized_boxes, ensure_ascii=False))
+            logging.info(
+                "[ERP-AGENT] boxes:\n%s",
+                ErpAgentClient._format_json_for_log(normalized_boxes),
+            )
             logging.info("=" * 60)
             logging.info("")
 
@@ -780,7 +814,10 @@ class PrintAgent:
         logging.info("    request_id: %s", request.request_id)
         logging.info("    endpoint_key: %s", request.endpoint_key)
         logging.info("    attempts: %d/%d", request.attempts, request.max_attempts)
-        logging.info("    request_payload: %s", json.dumps(request.request_payload, ensure_ascii=False)[:500])
+        logging.info(
+            "    request_payload:\n%s",
+            ErpAgentClient._format_json_for_log(request.request_payload),
+        )
         logging.info("")
 
         if request.business_type == "erp_box_fetch":
@@ -851,7 +888,10 @@ class PrintAgent:
         logging.info("[ERP-AGENT] endpoint_key: completion_event")
         logging.info("[ERP-AGENT] request_id: %s", request.request_id)
         logging.info("[ERP-AGENT] correlation_id: %s", correlation_id)
-        logging.info("[ERP-AGENT] PAYLOAD: %s", json.dumps(erp_payload, ensure_ascii=False))
+        logging.info(
+            "[ERP-AGENT] PAYLOAD:\n%s",
+            ErpAgentClient._format_json_for_log(erp_payload),
+        )
         logging.info("=" * 60)
 
         try:
@@ -887,7 +927,10 @@ class PrintAgent:
             logging.info("[ERP-AGENT] === COMPLETION EVENT RESPONSE FROM 1C ===")
             logging.info("[ERP-AGENT] request_id: %s", request.request_id)
             logging.info("[ERP-AGENT] status: success")
-            logging.info("[ERP-AGENT] response: %s", json.dumps(response_body, ensure_ascii=False))
+            logging.info(
+                "[ERP-AGENT] response:\n%s",
+                ErpAgentClient._format_json_for_log(response_body),
+            )
             logging.info("=" * 60)
             logging.info("")
 
