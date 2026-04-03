@@ -68,6 +68,48 @@ def show_error_message(title: str, message: str) -> None:
         print(f"  {message}")
 
 
+def ensure_env_file_exists() -> None:
+    """Create .env file from .env.example if it doesn't exist."""
+    from pathlib import Path
+
+    env_file = Path('.env')
+    env_example = Path('.env.example')
+
+    if not env_file.exists():
+        # Try to find .env.example in the current directory or the app data directory
+        if env_example.exists():
+            import shutil
+            shutil.copy(env_example, env_file)
+            print(f"Created .env file from .env.example")
+        else:
+            # Create a minimal .env file with required variables
+            minimal_env = """# QC Print Agent Configuration
+# Generated automatically on first run
+
+PRINT_AGENT_CALLBACK_URL=https://your-project.supabase.co/functions/v1/print-agent
+PRINT_AGENT_API_KEY=your-api-key-here
+
+# Print settings
+PRINTER_PORT=9100
+PRINTER_TIMEOUT_SECONDS=5
+
+# Polling
+POLL_INTERVAL_SECONDS=2
+MAX_CONCURRENT_JOBS=3
+
+# ERP (optional - remove if not using)
+# ERP_ENABLED=true
+"""
+            with open(env_file, 'w') as f:
+                f.write(minimal_env)
+            print(f"Created .env file with default configuration")
+            print()
+            print("IMPORTANT: Please edit .env file and update:")
+            print("  - PRINT_AGENT_CALLBACK_URL (your Supabase project URL)")
+            print("  - PRINT_AGENT_API_KEY (your API key)")
+            print()
+
+
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_CALLBACK_RETRIES = 3
 
@@ -2640,6 +2682,9 @@ def main() -> None:
         print("This appears to be your first time running the agent.")
         print("Launching setup wizard to pair with your warehouse...")
         print()
+
+        # Ensure .env file exists (create from .env.example or minimal defaults)
+        ensure_env_file_exists()
 
         # Debug logging
         state = store.load_state()
