@@ -238,6 +238,15 @@ class LocalConfigStore:
         """Get PID file path in app-data directory."""
         return self.pid_file
 
+    def reset_paired_state(self) -> None:
+        """Reset paired state - called when device is unpaired from server."""
+        state = self.load_state()
+        state["is_paired"] = False
+        state["paired_at"] = None
+        state["warehouse_id"] = None
+        self.save_state(state)
+        logging.info("[CONNECTOR] Paired state reset - device unpaired from server")
+
     def _strip_secrets(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Remove secrets from config before saving to JSON."""
         # Deep copy to avoid modifying original
@@ -803,6 +812,38 @@ class ConnectorManager:
         while True:
             self.send_heartbeat("online")
             time.sleep(30)
+
+    def verify_registration(self) -> bool:
+        """Verify that this device is still registered on the server.
+
+        Returns True if registered, False if unpaired/removed.
+        """
+        control_plane_token = self.secure.get_control_plane_token()
+        if not control_plane_token:
+            return False
+
+        try:
+            response = requests.get(
+                f"{self.api_base}?action=config&workstation_id={self.workstation_id}",
+                headers={
+                    "X-API-Key": self.shared_api_key,
+                    "X-Control-Plane-Token": control_plane_token
+                },
+                timeout=10
+            )
+
+            # 200 = registered, 401 = not found/removed, other = error
+            if response.status_code == 200:
+                return True
+            elif response.status_code == 401:
+                logging.warning("[CONNECTOR] Device no longer registered on server")
+                return False
+            else:
+                logging.warning(f"[CONNECTOR] Registration check failed: {response.status_code}")
+                return True  # Assume OK on network errors
+        except Exception as e:
+            logging.warning(f"[CONNECTOR] Registration check error: {e}")
+            return True  # Assume OK on network errors
 
     def _store_secrets(self, config: Dict[str, Any]) -> None:
         """Extract and store secrets from config to keychain."""
@@ -2768,6 +2809,48 @@ def main() -> None:
                 f"Failed to launch setup wizard:\n\n{error_details}\n\nPlease try again or contact support."
             )
             sys.exit(1)
+
+    # Device is paired locally - verify it's still registered on server
+    # (handles case where device was unpaired from frontend)
+    print("QC Print Agent - Verifying registration...")
+    try:
+        config = load_config()
+        manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
+
+        if not manager.verify_registration():
+            print("Device is no longer registered on the server.")
+            print("Resetting local state and launching setup wizard...")
+            print()
+
+            # Reset paired state
+            store.reset_paired_state()
+
+            # Clear control-plane token from keychain
+            manager.secure.set_control_plane_token("")
+
+            # Launch setup wizard
+            ensure_env_file_exists()
+
+            if not TKINTER_AVAILABLE:
+                show_error_message(
+                    "Setup Wizard Error",
+                    "Tkinter GUI is not available.\n\nPlease reinstall the application."
+                )
+                sys.exit(1)
+
+            wizard = SetupWizard(manager)
+            wizard.run()
+
+            show_error_message(
+                "Setup Complete",
+                "Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs."
+            )
+            sys.exit(0)
+    except Exception as exc:
+        # On network errors, continue anyway (might be temporary)
+        print(f"Warning: Could not verify registration: {exc}")
+        print("Continuing with local state...")
+        print()
 
     # Check for existing instance
     if check_pid_file():
