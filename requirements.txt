@@ -1,2 +1,4 @@
 requests>=2.31.0,<3
 psutil>=5.9.0  # For process management (Windows daemon mode)
+keyring>=25.0.0  # For OS keychain integration (secure credential storage)
+pyinstaller>=6.0.0  # For building Windows/macOS installers

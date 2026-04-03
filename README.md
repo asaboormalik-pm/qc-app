@@ -64,16 +64,62 @@ Get-Content print_agent.log -Wait  # PowerShell
 - ✅ Logs written to file for later review
 - ✅ Graceful shutdown (finishes current jobs before stopping)
 
+## Firewall Requirements
+
+**IMPORTANT:** The connector requires outbound network access to function properly. Configure your firewall to allow:
+
+| Destination | Port | Protocol | Purpose |
+|-------------|------|----------|---------|
+| Printers (e.g., 10.0.0.25) | `9100` or `9109` | TCP | Sending ZPL label data |
+| Supabase edge functions | `443` | HTTPS | Polling for jobs, callbacks |
+| ERP endpoints (if enabled) | `80` or `443` | HTTP/HTTPS | Box fetch, completion events |
+
+### Windows Firewall
+
+If connector cannot reach printers, add an outbound rule:
+
+```powershell
+# Allow python.exe to connect to printer ports
+New-NetFirewallRule -DisplayName "QC Connector - Printer Ports" `
+    -Direction Outbound -Program "python.exe" `
+    -Protocol TCP -RemotePort 9100,9109 -Action Allow
+```
+
+**Symptoms of firewall blocking:**
+- `WinError 10013`: An attempt was made to access a socket in a way forbidden by its access permissions
+- Connection timeout errors when testing with `--test-print <printer_ip>`
+
+### macOS Firewall
+
+macOS Application Firewall is less restrictive by default. If issues occur:
+1. Open **System Settings → Network → Firewall**
+2. Ensure Python or QC Connector is allowed to accept incoming connections (if needed)
+3. For outbound connections, macOS rarely blocks - check network/router settings instead
+
+### Linux Firewall (iptables/firewalld)
+
+```bash
+# For iptables
+sudo iptables -A OUTPUT -p tcp --dport 9100 -j ACCEPT
+sudo iptables -A OUTPUT -p tcp --dport 9109 -j ACCEPT
+
+# For firewalld (RHEL/CentOS/Fedora)
+sudo firewall-cmd --add-port=9100/tcp --permanent
+sudo firewall-cmd --add-port=9109/tcp --permanent
+sudo firewall-cmd --reload
+```
+
 ## Deployment (Production)
 
 See deployment guide in [docs/deployment.md](docs/deployment.md) or runbook below:
 
 1. **Prepare host** - Linux VM with Python 3.10+, network access to printers and Supabase
-2. **Create service user** - `sudo useradd --system qcprint`
-3. **Install dependencies** - `pip install -r requirements.txt`
-4. **Configure .env** - Set `PRINT_AGENT_CALLBACK_URL` and `PRINT_AGENT_API_KEY`
-5. **Install as service** - Create systemd service (see below)
-6. **Start and monitor** - `sudo systemctl start qc-print-agent`
+2. **Configure firewall** - Allow outbound TCP to printer ports (see above)
+3. **Create service user** - `sudo useradd --system qcprint`
+4. **Install dependencies** - `pip install -r requirements.txt`
+5. **Configure .env** - Set `PRINT_AGENT_CALLBACK_URL` and `PRINT_AGENT_API_KEY`
+6. **Install as service** - Create systemd service (see below)
+7. **Start and monitor** - `sudo systemctl start qc-print-agent`
 
 ### Systemd Service
 

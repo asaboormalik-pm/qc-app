@@ -21,6 +21,9 @@ import base64
 import hashlib
 import re
 import uuid
+import platform as platform_module
+from pathlib import Path
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,8 +40,198 @@ except AttributeError:
 import requests
 
 
+# Tkinter for setup wizard (imported only when needed)
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    TKINTER_AVAILABLE = True
+except ImportError:
+    TKINTER_AVAILABLE = False
+
+
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_CALLBACK_RETRIES = 3
+
+
+class ConfigError(Exception):
+    """Configuration error exception."""
+    pass
+
+
+class LocalConfigStore:
+    """Handles persistent storage for connector state and config in platform-specific app-data directories."""
+
+    @staticmethod
+    def get_app_data_dir() -> Path:
+        """Returns platform-specific app data directory."""
+        system = platform_module.system().lower()
+        if system == "windows":
+            base = os.environ.get("APPDATA", os.path.expanduser("~"))
+            return Path(base) / "QCConnector"
+        elif system == "darwin":
+            base = os.path.expanduser("~/Library/Application Support")
+            return Path(base) / "QCConnector"
+        else:  # linux, etc.
+            base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+            return Path(base) / "qc-connector"
+
+    def __init__(self):
+        self.app_data_dir = self.get_app_data_dir()
+        self.app_data_dir.mkdir(parents=True, exist_ok=True)
+        self.config_file = self.app_data_dir / "config.json"
+        self.state_file = self.app_data_dir / "state.json"
+        self.log_file = self.app_data_dir / "print_agent.log"
+        self.pid_file = self.app_data_dir / "print_agent.pid"
+
+    def save_config(self, config: Dict[str, Any]) -> None:
+        """Save non-secret connector configuration to JSON."""
+        non_secret_config = self._strip_secrets(config)
+        with open(self.config_file, 'w', encoding='utf-8') as f:
+            json.dump(non_secret_config, f, indent=2)
+
+    def load_config(self) -> Optional[Dict[str, Any]]:
+        """Load non-secret connector configuration from JSON."""
+        if self.config_file.exists():
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return None
+
+    def save_state(self, state: Dict[str, Any]) -> None:
+        """Save runtime state to JSON."""
+        with open(self.state_file, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=2)
+
+    def load_state(self) -> Dict[str, Any]:
+        """Load runtime state, creating default if missing."""
+        if self.state_file.exists():
+            with open(self.state_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+
+        # Default state - generate workstation ID once
+        default_state = {
+            "workstation_id": str(uuid.uuid4()),
+            "is_paired": False,
+            "paired_at": None,
+            "warehouse_id": None,
+            "station_name": None
+        }
+        self.save_state(default_state)
+        return default_state
+
+    def is_paired(self) -> bool:
+        """Check if connector has been paired."""
+        state = self.load_state()
+        return state.get("is_paired", False)
+
+    def get_workstation_id(self) -> str:
+        """Get workstation ID (generated once, persisted)."""
+        state = self.load_state()
+        return state["workstation_id"]
+
+    def save_workstation_id(self, workstation_id: str) -> None:
+        """Save workstation ID to state (used when backend assigns one during pairing)."""
+        state = self.load_state()
+        state["workstation_id"] = workstation_id
+        self.save_state(state)
+
+    def get_log_path(self) -> Path:
+        """Get log file path in app-data directory."""
+        return self.log_file
+
+    def get_pid_path(self) -> Path:
+        """Get PID file path in app-data directory."""
+        return self.pid_file
+
+    def _strip_secrets(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove secrets from config before saving to JSON."""
+        # Deep copy to avoid modifying original
+        config = json.loads(json.dumps(config))
+
+        # Strip ERP secrets
+        if "erp_auth_basic_password" in config:
+            config["erp_auth_basic_password"] = "***REDACTED***"
+        if "erp_auth_bearer_token" in config:
+            config["erp_auth_bearer_token"] = "***REDACTED***"
+        if "print_agent_api_key" in config:
+            config["print_agent_api_key"] = "***REDACTED***"
+        if "erp_agent_api_key" in config:
+            config["erp_agent_api_key"] = "***REDACTED***"
+
+        return config
+
+
+class SecureStorage:
+    """Handles secure storage of secrets using OS keychain (Windows Credential Manager / macOS Keychain)."""
+
+    def __init__(self, service_name: str = "QCConnector"):
+        self.service_name = service_name
+
+    def set_shared_api_key(self, api_key: str) -> None:
+        """Store shared edge function API key."""
+        import keyring
+        keyring.set_password(self.service_name, "shared_api_key", api_key)
+
+    def get_shared_api_key(self) -> Optional[str]:
+        """Retrieve shared edge function API key."""
+        import keyring
+        return keyring.get_password(self.service_name, "shared_api_key")
+
+    def set_control_plane_token(self, token: str) -> None:
+        """Store per-device control-plane token."""
+        import keyring
+        keyring.set_password(self.service_name, "control_plane_token", token)
+
+    def get_control_plane_token(self) -> Optional[str]:
+        """Retrieve per-device control-plane token."""
+        import keyring
+        return keyring.get_password(self.service_name, "control_plane_token")
+
+    def set_erp_basic_auth(self, username: str, password: str) -> None:
+        """Store ERP basic auth credentials."""
+        import keyring
+        keyring.set_password(self.service_name, "erp_basic_username", username)
+        keyring.set_password(self.service_name, "erp_basic_password", password)
+
+    def get_erp_basic_auth(self) -> tuple[Optional[str], Optional[str]]:
+        """Retrieve ERP basic auth credentials."""
+        import keyring
+        username = keyring.get_password(self.service_name, "erp_basic_username")
+        password = keyring.get_password(self.service_name, "erp_basic_password")
+        return username, password
+
+    def set_erp_bearer_token(self, token: str) -> None:
+        """Store ERP bearer token."""
+        import keyring
+        keyring.set_password(self.service_name, "erp_bearer_token", token)
+
+    def get_erp_bearer_token(self) -> Optional[str]:
+        """Retrieve ERP bearer token."""
+        import keyring
+        return keyring.get_password(self.service_name, "erp_bearer_token")
+
+    def clear_all(self) -> None:
+        """Clear all stored credentials (for unpairing)."""
+        import keyring
+        try:
+            keyring.delete_password(self.service_name, "shared_api_key")
+        except:
+            pass
+        try:
+            keyring.delete_password(self.service_name, "control_plane_token")
+        except:
+            pass
+        try:
+            keyring.delete_password(self.service_name, "erp_basic_username")
+        except:
+            pass
+        try:
+            keyring.delete_password(self.service_name, "erp_basic_password")
+        except:
+            pass
+        try:
+            keyring.delete_password(self.service_name, "erp_bearer_token")
+        except:
+            pass
 
 
 @dataclass
@@ -350,6 +543,286 @@ class ErpAgentClient:
                 logging.error("[ERP-AGENT] HTTP error in callback for request_id=%s: %s",
                             request_id, exc)
                 raise
+
+
+class ConnectorManager:
+    """Handles pairing, config refresh, and heartbeat for installed connector."""
+
+    def __init__(self, api_base: str, shared_api_key: str):
+        self.api_base = api_base
+        self.shared_api_key = shared_api_key
+        self.store = LocalConfigStore()
+        self.secure = SecureStorage()
+        self.workstation_id = self.store.get_workstation_id()
+        self.state = self.store.load_state()
+
+    def pair_with_code(self, pairing_code: str, station_name: str = None) -> Dict[str, Any]:
+        """Redeem pairing code and receive initial config from backend.
+
+        The edge function will use the workstation_id from the pairing code (selected by admin),
+        so we don't send workstationId in the payload. The response includes the assigned workstationId.
+        """
+
+        payload = {
+            "code": pairing_code,
+            "osType": platform_module.system().lower(),
+            "appVersion": "1.0.0"
+        }
+
+        try:
+            response = requests.post(
+                f"{self.api_base}?action=pair",
+                headers={"X-API-Key": self.shared_api_key, "Content-Type": "application/json"},
+                json=payload,
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success"):
+                    # Store secrets in keychain
+                    config = data["config"]
+                    self._store_secrets(config)
+
+                    # Store non-secret config in app data
+                    self.store.save_config(config)
+
+                    # Store control-plane token
+                    control_plane_token = data.get("controlPlaneToken")
+                    if control_plane_token:
+                        self.secure.set_control_plane_token(control_plane_token)
+
+                    # Update workstation_id from response (assigned by backend)
+                    workstation_id = data.get("workstationId")
+                    if workstation_id:
+                        self.workstation_id = workstation_id
+                        self.store.save_workstation_id(workstation_id)
+
+                    # Update pairing state
+                    self.state["is_paired"] = True
+                    self.state["paired_at"] = datetime.now(timezone.utc).isoformat()
+                    self.state["warehouse_id"] = data.get("warehouseId")
+                    self.state["station_name"] = data.get("stationName") or data.get("station_name")
+                    self.store.save_state(self.state)
+
+                    logging.info(f"[CONNECTOR] Successfully paired to {data.get('stationName', 'Unknown')} (workstation: {workstation_id})")
+                    return {"success": True, "stationName": data.get("stationName"), "workstationId": workstation_id}
+                else:
+                    error_msg = data.get("error", "Unknown error")
+                    logging.warning(f"[CONNECTOR] Pairing failed: {error_msg}")
+                    return {"success": False, "error": error_msg}
+
+            # Try to parse error response
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("error", f"HTTP {response.status_code}")
+                logging.warning(f"[CONNECTOR] Pairing failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+            except:
+                logging.warning(f"[CONNECTOR] Pairing failed: HTTP {response.status_code}")
+                return {"success": False, "error": f"HTTP {response.status_code}"}
+
+        except Exception as e:
+            logging.error(f"[CONNECTOR] Pairing error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def fetch_config(self) -> Optional[Dict[str, Any]]:
+        """Fetch latest config from backend."""
+
+        if not self.store.is_paired():
+            return None
+
+        control_plane_token = self.secure.get_control_plane_token()
+        if not control_plane_token:
+            logging.error("[CONNECTOR] No control-plane token found")
+            return None
+
+        try:
+            response = requests.get(
+                f"{self.api_base}?action=config&workstation_id={self.workstation_id}",
+                headers={
+                    "X-API-Key": self.shared_api_key,
+                    "X-Control-Plane-Token": control_plane_token
+                },
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                config = data.get("config")
+
+                # Store new secrets in keychain
+                self._store_secrets(config)
+
+                # Update local config cache
+                self.store.save_config(config)
+
+                logging.info("[CONNECTOR] Config refreshed from backend")
+                return config
+
+            elif response.status_code == 401:
+                logging.error("[CONNECTOR] Control-plane token invalid or expired")
+            else:
+                logging.warning(f"[CONNECTOR] Config fetch failed: {response.status_code}")
+
+        except Exception as e:
+            logging.warning(f"[CONNECTOR] Config fetch error: {e}")
+
+        return None
+
+    def send_heartbeat(self, status: str = "online", error: str = None) -> None:
+        """Send heartbeat to backend."""
+
+        control_plane_token = self.secure.get_control_plane_token()
+        if not control_plane_token:
+            return
+
+        payload = {
+            "workstationId": self.workstation_id,
+            "status": status,
+            "appVersion": "1.0.0",
+            "osType": platform_module.system().lower(),
+            "lastError": error
+        }
+
+        try:
+            requests.post(
+                f"{self.api_base}?action=heartbeat",
+                headers={
+                    "X-API-Key": self.shared_api_key,
+                    "X-Control-Plane-Token": control_plane_token,
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=5
+            )
+        except Exception as e:
+            logging.warning(f"[CONNECTOR] Heartbeat failed: {e}")
+
+    def run_heartbeat_loop(self) -> None:
+        """Background thread sending heartbeat every 30 seconds."""
+        while True:
+            self.send_heartbeat("online")
+            time.sleep(30)
+
+    def _store_secrets(self, config: Dict[str, Any]) -> None:
+        """Extract and store secrets from config to keychain."""
+
+        # Store shared API key
+        if "apiKey" in config:
+            self.secure.set_shared_api_key(config["apiKey"])
+        elif "edgeFunctions" in config and "apiKey" in config["edgeFunctions"]:
+            self.secure.set_shared_api_key(config["edgeFunctions"]["apiKey"])
+
+        # Store ERP auth secrets
+        if "erp" in config and "auth" in config["erp"]:
+            auth = config["erp"]["auth"]
+            mode = auth.get("mode", "none")
+
+            if mode == "basic":
+                username = auth.get("basicUsername")
+                password = auth.get("basicPassword")
+                if username and password:
+                    self.secure.set_erp_basic_auth(username, password)
+
+            elif mode == "bearer":
+                token = auth.get("bearerToken")
+                if token:
+                    self.secure.set_erp_bearer_token(token)
+
+
+class SetupWizard:
+    """First-run setup wizard for connector pairing."""
+
+    def __init__(self, connector_manager: ConnectorManager):
+        if not TKINTER_AVAILABLE:
+            raise RuntimeError("Tkinter is not available. Please install python3-tk.")
+
+        self.root = tk.Tk()
+        self.connector = connector_manager
+        self.root.title("QC Connector Setup")
+        self.root.geometry("500x400")
+        self.root.resizable(False, False)
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Header
+        header = ttk.Label(self.root, text="Connect to Warehouse", font=("Helvetica", 16, "bold"))
+        header.pack(pady=20)
+
+        # Instructions
+        instructions = ttk.Label(
+            self.root,
+            text="Enter the 6-digit pairing code from the warehouse connector page:",
+            wraplength=450
+        )
+        instructions.pack(pady=10)
+
+        # Pairing code input
+        code_frame = ttk.Frame(self.root)
+        code_frame.pack(pady=20)
+
+        ttk.Label(code_frame, text="Pairing Code:").pack(side=tk.LEFT, padx=5)
+
+        self.code_entry = ttk.Entry(code_frame, width=15, font=("Courier", 14))
+        self.code_entry.pack(side=tk.LEFT, padx=5)
+        self.code_entry.focus()
+
+        # Station name (optional)
+        name_frame = ttk.Frame(self.root)
+        name_frame.pack(pady=10)
+
+        ttk.Label(name_frame, text="Station Name (optional):").pack(side=tk.LEFT, padx=5)
+
+        self.name_entry = ttk.Entry(name_frame, width=30)
+        self.name_entry.pack(side=tk.LEFT, padx=5)
+
+        # Buttons
+        button_frame = ttk.Frame(self.root)
+        button_frame.pack(pady=20)
+
+        ttk.Button(button_frame, text="Connect", command=self.on_connect, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=self.on_cancel, width=15).pack(side=tk.LEFT, padx=5)
+
+        # Status
+        self.status_label = ttk.Label(self.root, text="", wraplength=450)
+        self.status_label.pack(pady=20)
+
+    def on_connect(self):
+        from tkinter import messagebox
+
+        code = self.code_entry.get().strip().upper()
+        station_name = self.name_entry.get().strip() or None
+
+        if not code or len(code) != 6:
+            messagebox.showerror("Error", "Please enter a valid 6-digit pairing code")
+            return
+
+        self.status_label.config(text="Connecting to warehouse...")
+        self.root.update()
+
+        result = self.connector.pair_with_code(code, station_name)
+
+        if result.get("success"):
+            station_name = result.get("stationName", "Unknown")
+            messagebox.showinfo(
+                "Success",
+                f"Successfully paired to {station_name}!\n\n"
+                f"You can now close this window. The connector will start automatically."
+            )
+            self.on_cancel()
+        else:
+            error = result.get("error", "Unknown error")
+            messagebox.showerror("Error", f"Failed to pair: {error}")
+            self.status_label.config(text="")
+
+    def on_cancel(self):
+        self.root.destroy()
+
+    def run(self):
+        """Start the Tkinter main loop."""
+        self.root.mainloop()
 
 
 class PrintAgent:
@@ -1514,6 +1987,48 @@ class PrintAgent:
             return False
         return self.process_job(job)
 
+    def test_printer_connection(self, printer_ip: str, port: int = None) -> Dict[str, Any]:
+        """Test TCP connection to printer."""
+        try:
+            port = port or self.config.printer_port
+            with socket.create_connection((printer_ip, port), timeout=5):
+                return {"success": True, "message": f"Connected to {printer_ip}:{port}"}
+        except socket.timeout:
+            return {"success": False, "error": "Connection timeout"}
+        except ConnectionRefusedError:
+            return {"success": False, "error": "Connection refused"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def test_erp_connection(self, endpoint_key: str, test_payload: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Test HTTP connection to ERP endpoint."""
+
+        if endpoint_key not in self.config.erp_endpoints:
+            return {"success": False, "error": f"Unknown endpoint: {endpoint_key}"}
+
+        endpoint = self.config.erp_endpoints[endpoint_key]
+        test_payload = test_payload or {"test": True}
+
+        try:
+            # Use actual current ERP helper signature
+            response = self._send_erp_http_request(
+                endpoint_key=endpoint_key,
+                payload=test_payload,
+                request_id=str(uuid.uuid4()),
+            )
+
+            if response.get("response_code") == 200:
+                return {"success": True, "message": f"Connected to {endpoint.url}"}
+            else:
+                return {"success": False, "error": f"HTTP {response.get('response_code')}"}
+
+        except requests.exceptions.Timeout:
+            return {"success": False, "error": "Connection timeout"}
+        except requests.exceptions.ConnectionError:
+            return {"success": False, "error": "Connection refused"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
 
 def load_dotenv(path: str = ".env") -> None:
     """Load KEY=VALUE lines from a local .env file if present."""
@@ -1599,6 +2114,108 @@ def parse_erp_endpoints(raw_json: str, default_timeout_seconds: float) -> Dict[s
 
 
 def load_config() -> Config:
+    """Load configuration from paired store or legacy .env path."""
+
+    # Try paired config path first
+    store = LocalConfigStore()
+    if store.is_paired():
+        try:
+            return _load_paired_config(store)
+        except Exception as e:
+            logging.warning(f"Failed to load paired config, falling back to legacy: {e}")
+            # Fall through to legacy path
+
+    # Fall back to legacy env path
+    return _load_legacy_env_config()
+
+
+def _load_paired_config(store: LocalConfigStore) -> Config:
+    """Load config from paired connector storage (app-data + keychain)."""
+
+    secure = SecureStorage()
+    config_json = store.load_config()
+
+    if not config_json:
+        raise ConfigError("No config found in paired storage")
+
+    # Load configuration from JSON with fallbacks
+    print_agent_url = config_json.get("print_agent_url") or config_json.get("printAgentUrl", "")
+    print_agent_api_key = secure.get_shared_api_key()
+    if not print_agent_api_key:
+        # Try loading from .env as fallback
+        load_dotenv()
+        print_agent_api_key = os.getenv("PRINT_AGENT_API_KEY", "")
+
+    if not print_agent_url or not print_agent_api_key:
+        raise ConfigError("Missing required configuration: print_agent_url and print_agent_api_key")
+
+    # Load ERP auth from keychain
+    erp_auth_mode = config_json.get("erp_auth_mode") or config_json.get("erp", {}).get("auth", {}).get("mode", "none")
+
+    if erp_auth_mode == "basic":
+        username, password = secure.get_erp_basic_auth()
+        erp_auth_basic_username = username
+        erp_auth_basic_password = password
+        erp_auth_bearer_token = None
+    elif erp_auth_mode == "bearer":
+        erp_auth_basic_username = None
+        erp_auth_basic_password = None
+        erp_auth_bearer_token = secure.get_erp_bearer_token()
+    else:
+        erp_auth_basic_username = None
+        erp_auth_basic_password = None
+        erp_auth_bearer_token = None
+
+    # Parse ERP endpoints from config
+    erp_endpoints_raw = config_json.get("erp_endpoints_json", "{}")
+    if not erp_endpoints_raw and "erp" in config_json and "endpoints" in config_json["erp"]:
+        # Convert from new format
+        endpoints_dict = config_json["erp"]["endpoints"]
+        erp_endpoints_raw = json.dumps(endpoints_dict)
+
+    erp_default_timeout = config_json.get("erp_default_timeout_seconds", 10)
+    erp_endpoints = parse_erp_endpoints(
+        erp_endpoints_raw or "{}",
+        default_timeout_seconds=float(erp_default_timeout),
+    )
+
+    config = Config(
+        print_agent_url=print_agent_url,
+        print_agent_api_key=print_agent_api_key,
+        poll_interval_seconds=config_json.get("poll_interval_seconds", 2.0),
+        printer_port=config_json.get("printer_port", 9100),
+        printer_timeout_seconds=config_json.get("printer_timeout_seconds", 5.0),
+        max_concurrent_jobs=config_json.get("max_concurrent_jobs", 3),
+        workstation_id=store.get_workstation_id(),
+        erp_enabled=config_json.get("erp_enabled", False),
+        erp_endpoints=erp_endpoints,
+        erp_auth_mode=erp_auth_mode,
+        erp_auth_bearer_token=erp_auth_bearer_token,
+        erp_auth_basic_username=erp_auth_basic_username,
+        erp_auth_basic_password=erp_auth_basic_password,
+        erp_auth_static_headers=config_json.get("erp_auth_static_headers", {}),
+        erp_retry_attempts=config_json.get("erp_retry_attempts", 0),
+        erp_retry_backoff_seconds=config_json.get("erp_retry_backoff_seconds", 1.0),
+        erp_default_timeout_seconds=config_json.get("erp_default_timeout_seconds", 10.0),
+        erp_timeout_max_seconds=config_json.get("erp_timeout_max_seconds", 30.0),
+        erp_retry_max_attempts=config_json.get("erp_retry_max_attempts", 3),
+        erp_retry_backoff_base_seconds=config_json.get("erp_retry_backoff_base_seconds", 1.0),
+        erp_retry_backoff_max_seconds=config_json.get("erp_retry_backoff_max_seconds", 60.0),
+        erp_retry_jitter_seconds=config_json.get("erp_retry_jitter_seconds", 1.0),
+        erp_agent_enabled=config_json.get("erp_agent_enabled", False),
+        erp_agent_url=config_json.get("erp_agent_url", ""),
+        erp_agent_api_key=print_agent_api_key,  # Use same API key for ERP agent
+        erp_agent_poll_interval_seconds=config_json.get("erp_agent_poll_interval_seconds", 2.0),
+        erp_agent_max_concurrent_requests=config_json.get("erp_agent_max_concurrent_requests", 2),
+    )
+
+    state = store.load_state()
+    logging.info(f"Loaded paired config (workstation: {state['workstation_id']}, warehouse: {state.get('warehouse_id', 'N/A')})")
+    return config
+
+
+def _load_legacy_env_config() -> Config:
+    """Load config from .env/environment variables (legacy/dev mode)."""
     load_dotenv()
     max_jobs = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
     if max_jobs < 1:
@@ -1764,30 +2381,29 @@ def load_config() -> Config:
         erp_agent_poll_interval_seconds=erp_agent_poll_interval,
         erp_agent_max_concurrent_requests=erp_agent_max_concurrent,
     )
-    pprint.pprint(config)
+    logging.info("Loaded config from .env (unpaired or development mode)")
     return config
 
 
-PID_FILE = "print_agent.pid"
-
-
 def write_pid_file() -> None:
-    """Write current process ID to PID file."""
+    """Write current process ID to PID file in app-data directory."""
+    store = LocalConfigStore()
     pid = os.getpid()
     try:
-        with open(PID_FILE, "w", encoding="utf-8") as f:
+        with open(store.get_pid_path(), "w", encoding="utf-8") as f:
             f.write(str(pid))
-        logging.info("PID file created: %s (PID=%d)", PID_FILE, pid)
+        logging.info("PID file created: %s (PID=%d)", store.get_pid_path(), pid)
     except Exception as exc:
         logging.warning("Could not create PID file: %s", exc)
 
 
 def remove_pid_file() -> None:
     """Remove PID file on clean shutdown."""
+    store = LocalConfigStore()
     try:
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-            logging.info("PID file removed: %s", PID_FILE)
+        if store.get_pid_path().exists():
+            store.get_pid_path().unlink()
+            logging.info("PID file removed: %s", store.get_pid_path())
     except Exception as exc:
         logging.warning("Could not remove PID file: %s", exc)
 
@@ -1798,23 +2414,26 @@ def check_pid_file() -> bool:
     Returns True if another instance is running, False otherwise.
     Also cleans up stale PID files (>1 hour old) to prevent issues after crashes.
     """
-    if not os.path.exists(PID_FILE):
+    store = LocalConfigStore()
+    pid_file = store.get_pid_path()
+
+    if not pid_file.exists():
         return False
 
     try:
         # Check if PID file is stale (crashed process left PID file behind)
         import time
-        pid_file_age = time.time() - os.path.getmtime(PID_FILE)
+        pid_file_age = time.time() - pid_file.stat().st_mtime
         if pid_file_age > 3600:  # 1 hour
             logging.warning("Found stale PID file (age=%d seconds) - removing", pid_file_age)
             try:
-                os.remove(PID_FILE)
+                pid_file.unlink()
                 logging.info("Stale PID file removed")
             except Exception as exc:
                 logging.warning("Could not remove stale PID file: %s", exc)
             return False
 
-        with open(PID_FILE, "r", encoding="utf-8") as f:
+        with open(pid_file, "r", encoding="utf-8") as f:
             pid = int(f.read().strip())
 
         # Check if process is still running
@@ -1887,16 +2506,34 @@ def main() -> None:
         action="store_true",
         help="Check if daemon is running"
     )
+
+    # NEW: Setup and testing arguments for warehouse connector
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Launch first-run setup wizard for pairing"
+    )
+    parser.add_argument(
+        "--test-print",
+        metavar="PRINTER_IP",
+        help="Test printer connection (e.g., --test-print 10.0.0.25)"
+    )
+    parser.add_argument(
+        "--test-erp",
+        metavar="ENDPOINT_KEY",
+        help="Test ERP connection (e.g., --test-erp erp_box_fetch)"
+    )
+
     args = parser.parse_args()
 
     # Handle --stop command
     if args.stop:
-        if not os.path.exists(PID_FILE):
+        if not os.path.exists(LocalConfigStore().get_pid_path()):
             print("No PID file found - agent may not be running")
             sys.exit(1)
 
         try:
-            with open(PID_FILE, "r", encoding="utf-8") as f:
+            with open(LocalConfigStore().get_pid_path(), "r", encoding="utf-8") as f:
                 pid = int(f.read().strip())
 
             print(f"Stopping print agent (PID={pid})...")
@@ -1929,13 +2566,51 @@ def main() -> None:
     if args.status:
         if check_pid_file():
             try:
-                with open(PID_FILE, "r", encoding="utf-8") as f:
+                with open(LocalConfigStore().get_pid_path(), "r", encoding="utf-8") as f:
                     pid = int(f.read().strip())
                 print(f"Print agent is running (PID={pid})")
             except Exception:
                 print("Print agent status unknown (PID file exists but unreadable)")
         else:
             print("Print agent is not running")
+        return
+
+    # NEW: Handle --setup command
+    if args.setup:
+        try:
+            config = load_config()
+            manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
+            wizard = SetupWizard(manager)
+            wizard.run()
+        except Exception as exc:
+            print(f"Setup wizard error: {exc}")
+            sys.exit(1)
+        return
+
+    # NEW: Handle --test-print command
+    if args.test_print:
+        try:
+            config = load_config()
+            agent = PrintAgent(config)
+            result = agent.test_printer_connection(args.test_print)
+            print(json.dumps(result, indent=2))
+            sys.exit(0 if result.get("success") else 1)
+        except Exception as exc:
+            print(f"Printer test error: {exc}")
+            sys.exit(1)
+        return
+
+    # NEW: Handle --test-erp command
+    if args.test_erp:
+        try:
+            config = load_config()
+            agent = PrintAgent(config)
+            result = agent.test_erp_connection(args.test_erp)
+            print(json.dumps(result, indent=2))
+            sys.exit(0 if result.get("success") else 1)
+        except Exception as exc:
+            print(f"ERP test error: {exc}")
+            sys.exit(1)
         return
 
     # Check for existing instance
@@ -1970,6 +2645,24 @@ def main() -> None:
             erp_thread = threading.Thread(target=agent.run_erp_forever, daemon=True, name="ErpAgentLoop")
             erp_thread.start()
             logging.info("Started ERP-agent loop in background thread")
+
+        # Start heartbeat loop if paired (for warehouse connector)
+        store = LocalConfigStore()
+        if store.is_paired():
+            try:
+                connector = ConnectorManager(
+                    api_base=config.print_agent_url,
+                    shared_api_key=config.print_agent_api_key
+                )
+                heartbeat_thread = threading.Thread(
+                    target=connector.run_heartbeat_loop,
+                    daemon=True,
+                    name="HeartbeatLoop"
+                )
+                heartbeat_thread.start()
+                logging.info(f"[CONNECTOR] Started heartbeat loop (workstation: {connector.workstation_id})")
+            except Exception as exc:
+                logging.warning(f"[CONNECTOR] Failed to start heartbeat loop: {exc}")
 
         # Run print loop in main thread
         agent.run_forever()
