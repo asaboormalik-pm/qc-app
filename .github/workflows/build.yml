@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -55,7 +58,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          python3 -m PyInstaller print_agent.spec --clean --windowed
+          python3 -m PyInstaller print_agent.spec --clean
 
       - name: Create ZIP for app bundle
         run: |
