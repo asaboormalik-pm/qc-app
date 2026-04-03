@@ -2613,6 +2613,30 @@ def main() -> None:
             sys.exit(1)
         return
 
+    # Check if connector is paired - if not, launch setup wizard automatically
+    store = LocalConfigStore()
+    if not store.is_paired():
+        print("QC Print Agent - First Run Setup")
+        print("=" * 40)
+        print("This appears to be your first time running the agent.")
+        print("Launching setup wizard to pair with your warehouse...")
+        print()
+        try:
+            config = load_config()
+            manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
+            wizard = SetupWizard(manager)
+            wizard.run()
+            # After setup completes, exit - user needs to restart the agent
+            print()
+            print("Setup complete! Please run the agent again to start processing jobs.")
+            print("For background mode, use: qc-print-agent.exe --daemon")
+            sys.exit(0)
+        except Exception as exc:
+            print(f"Setup wizard error: {exc}")
+            print()
+            print("Please run: qc-print-agent.exe --setup")
+            sys.exit(1)
+
     # Check for existing instance
     if check_pid_file():
         print("ERROR: Another instance is already running!")
