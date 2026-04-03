@@ -2635,6 +2635,9 @@ def main() -> None:
             print(f"Setup wizard error: {exc}")
             print()
             print("Please run: qc-print-agent.exe --setup")
+            print()
+            print("Press Enter to exit...")
+            input()
             sys.exit(1)
 
     # Check for existing instance

@@ -55,7 +55,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'tkinter',  # Exclude GUI toolkit unless needed for setup wizard
+        # 'tkinter',  # INCLUDED - needed for setup wizard
         'matplotlib',
         'numpy',
         'pandas',
