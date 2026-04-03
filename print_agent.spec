@@ -50,6 +50,9 @@ datas = [
 # Binary files to include
 binaries = []
 
+# No need to manually collect Tcl/Tk - PyInstaller has built-in hooks for Tkinter
+# The hidden imports for tkinter modules should be sufficient
+
 a = Analysis(
     ['print_agent.py'],
     pathex=[],
@@ -89,7 +92,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,  # Show console for logging
+    console=False,  # GUI-only mode - no console window
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
