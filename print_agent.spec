@@ -12,6 +12,7 @@ Usage:
 import sys
 import os
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 # Platform-specific settings
 is_windows = sys.platform.startswith('win')
@@ -35,11 +36,8 @@ hiddenimports = [
     'keyring.backends.kwallet',
     'requests',
     'urllib3',
-    # Tkinter for setup wizard
-    'tkinter',
-    'tkinter.ttk',
-    'tkinter.messagebox',
-    'tkinter.simpledialog',
+    # Tkinter for setup wizard - collect all submodules
+    *collect_submodules('tkinter'),
 ]
 
 # Data files to include (templates, configs, etc.)
@@ -50,8 +48,15 @@ datas = [
 # Binary files to include
 binaries = []
 
-# No need to manually collect Tcl/Tk - PyInstaller has built-in hooks for Tkinter
-# The hidden imports for tkinter modules should be sufficient
+# CRITICAL: Collect Tcl/Tk data files for Windows
+# This ensures the GUI works in the bundled executable
+if is_windows:
+    try:
+        tkinter_datas = collect_data_files('tkinter')
+        datas.extend(tkinter_datas)
+    except Exception:
+        # If collect_data_files fails, try manual collection
+        pass
 
 a = Analysis(
     ['print_agent.py'],

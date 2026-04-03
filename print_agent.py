@@ -45,8 +45,13 @@ try:
     import tkinter as tk
     from tkinter import ttk
     from tkinter import messagebox
+    # Verify Tkinter can actually create windows (not just import)
+    test_root = tk.Tk()
+    test_root.withdraw()
+    test_root.destroy()
     TKINTER_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    print(f"WARNING: Tkinter not available: {e}")
     TKINTER_AVAILABLE = False
 
 
@@ -832,13 +837,22 @@ class SetupWizard:
         if not TKINTER_AVAILABLE:
             raise RuntimeError("Tkinter is not available. Please install python3-tk.")
 
-        self.root = tk.Tk()
+        print("DEBUG: Creating Tkinter root window...")
+        try:
+            self.root = tk.Tk()
+            print("DEBUG: Tkinter root created successfully")
+        except Exception as e:
+            print(f"ERROR: Failed to create Tkinter root: {e}")
+            raise RuntimeError(f"Failed to create GUI window: {e}")
+
         self.connector = connector_manager
         self.root.title("QC Connector Setup")
         self.root.geometry("500x400")
         self.root.resizable(False, False)
 
+        print("DEBUG: Creating widgets...")
         self.create_widgets()
+        print("DEBUG: Setup wizard initialized")
 
     def create_widgets(self):
         # Header
