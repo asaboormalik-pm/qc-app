@@ -90,22 +90,63 @@ def show_error_message(title: str, message: str) -> None:
         print(f"  {message}")
 
 
+def get_exe_dir() -> Path:
+    """Get the directory containing the executable (for bundled exe) or script (for dev)."""
+    if getattr(sys, 'frozen', False):
+        # Running as bundled executable
+        return Path(sys.executable).parent
+    else:
+        # Running as script - use current directory
+        return Path.cwd()
+
+
 def ensure_env_file_exists() -> None:
-    """Create .env file from .env.example if it doesn't exist."""
+    """Create .env file from .env.example if it doesn't exist.
+
+    Searches in multiple locations:
+    1. Exe directory (for bundled apps)
+    2. Current working directory
+    3. AppData directory (for paired state)
+    """
     from pathlib import Path
 
-    env_file = Path('.env')
-    env_example = Path('.env.example')
+    exe_dir = get_exe_dir()
+    cwd = Path.cwd()
 
-    if not env_file.exists():
-        # Try to find .env.example in the current directory or the app data directory
-        if env_example.exists():
-            import shutil
-            shutil.copy(env_example, env_file)
-            print(f"Created .env file from .env.example")
-        else:
-            # Create a minimal .env file with required variables
-            minimal_env = """# QC Print Agent Configuration
+    # Search paths in priority order
+    search_paths = [
+        exe_dir,           # Where the exe is located
+        cwd,               # Current working directory
+    ]
+
+    env_file = None
+    env_example = None
+
+    for search_path in search_paths:
+        test_env = search_path / '.env'
+        test_example = search_path / '.env.example'
+        if test_env.exists():
+            env_file = test_env
+            break
+        if test_example.exists():
+            env_example = test_example
+
+    # If .env already exists, we're done
+    if env_file and env_file.exists():
+        return
+
+    # Determine where to create .env (prefer exe directory)
+    target_dir = exe_dir if exe_dir.exists() else cwd
+    env_file = target_dir / '.env'
+
+    # Try to copy from .env.example
+    if env_example and env_example.exists():
+        import shutil
+        shutil.copy(env_example, env_file)
+        print(f"[CONFIG] Created .env file from .env.example at: {env_file}")
+    else:
+        # Create a minimal .env file with required variables
+        minimal_env = """# QC Print Agent Configuration
 # Generated automatically on first run
 
 PRINT_AGENT_CALLBACK_URL=https://your-project.supabase.co/functions/v1/print-agent
@@ -122,13 +163,14 @@ MAX_CONCURRENT_JOBS=3
 # ERP (optional - remove if not using)
 # ERP_ENABLED=true
 """
-            with open(env_file, 'w') as f:
-                f.write(minimal_env)
-            print(f"Created .env file with default configuration")
-            print()
-            print("IMPORTANT: The pairing wizard will automatically configure these values.")
-            print("            Just enter your pairing code and click Connect.")
-            print()
+        with open(env_file, 'w') as f:
+            f.write(minimal_env)
+        print(f"[CONFIG] Created .env file with default configuration at: {env_file}")
+
+    print()
+    print("IMPORTANT: The pairing wizard will automatically configure these values.")
+    print("            Just enter your pairing code and click Connect.")
+    print()
 
 
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
@@ -2268,10 +2310,37 @@ class PrintAgent:
 
 
 def load_dotenv(path: str = ".env") -> None:
-    """Load KEY=VALUE lines from a local .env file if present."""
-    if not os.path.exists(path):
+    """Load KEY=VALUE lines from a .env file.
+
+    Searches in multiple locations if path doesn't exist:
+    1. Provided path
+    2. Exe directory (for bundled apps)
+    3. Current working directory
+    """
+    from pathlib import Path
+
+    # If explicit path provided and exists, use it
+    env_path = Path(path)
+    if env_path.exists():
+        _load_env_file(env_path)
         return
 
+    # Search for .env in exe directory and current directory
+    search_paths = []
+    if getattr(sys, 'frozen', False):
+        # Running as bundled exe - check exe directory
+        search_paths.append(Path(sys.executable).parent / '.env')
+    # Check current working directory
+    search_paths.append(Path.cwd() / '.env')
+
+    for search_path in search_paths:
+        if search_path.exists():
+            _load_env_file(search_path)
+            return
+
+
+def _load_env_file(path: Path) -> None:
+    """Internal: Load environment variables from a specific .env file."""
     with open(path, "r", encoding="utf-8") as env_file:
         for raw_line in env_file:
             line = raw_line.strip()
@@ -2279,7 +2348,6 @@ def load_dotenv(path: str = ".env") -> None:
                 continue
             key, value = line.split("=", 1)
             print(f"Loading env var from .env: {key.strip()}={value.strip()}")
-            # os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
             os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 # https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent
