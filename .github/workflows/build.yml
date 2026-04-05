@@ -39,18 +39,23 @@ jobs:
           echo "=== Checking dist folder structure ==="
           dir dist\qc-print-agent
           echo ""
-          echo "=== Checking for Tcl/Tk files ==="
-          dir dist\qc-print-agent\tcl 2>nul || echo "No tcl folder found"
+          echo "=== Checking for _internal folder ==="
+          dir dist\qc-print-agent\_internal | Select-Object -First 20
           echo ""
-          echo "=== Checking for DLLs ==="
-          dir dist\qc-print-agent\*.dll 2>nul || echo "No DLLs found"
+          echo "=== Checking for Tcl/Tk data folders ==="
+          dir dist\qc-print-agent\_internal\_tcl_data 2>nul || echo "No _tcl_data folder"
+          dir dist\qc-print-agent\_internal\_tk_data 2>nul || echo "No _tk_data folder"
+          echo ""
+          echo "=== Checking for Tcl/Tk DLLs ==="
+          dir dist\qc-print-agent\_internal\tcl*.dll 2>nul || echo "No tcl DLLs"
+          dir dist\qc-print-agent\_internal\tk*.dll 2>nul || echo "No tk DLLs"
           echo ""
           echo "=== Build complete ==="
 
       - name: Create ZIP archive
         run: |
           cd dist
-          tar -czf qc-print-agent-windows.zip qc-print-agent/
+          Compress-Archive -Path qc-print-agent -DestinationPath qc-print-agent-windows.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
