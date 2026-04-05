@@ -35,14 +35,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Check if executable was created
-if exist dist\qc-print-agent.exe (
+REM Check if onedir executable was created
+if exist dist\qc-print-agent\qc-print-agent.exe (
+    if exist .env.example copy .env.example dist\qc-print-agent\.env.example >nul
     echo.
     echo ========================================
     echo Build successful!
     echo ========================================
     echo.
-    echo Executable: dist\qc-print-agent.exe
+    echo Executable: dist\qc-print-agent\qc-print-agent.exe
     echo.
 
     REM Create a simple installer script
@@ -51,8 +52,9 @@ if exist dist\qc-print-agent.exe (
     REM Create output directory
     if not exist installers mkdir installers
 
-    REM Copy executable to installers directory
-    copy dist\qc-print-agent.exe installers\ >nul
+    REM Copy packaged folder to installers directory
+    if exist installers\qc-print-agent rmdir /s /q installers\qc-print-agent
+    xcopy dist\qc-print-agent installers\qc-print-agent /E /I /Y >nul
     copy .env.example installers\.env.example >nul
 
     REM Create README for installer
@@ -60,10 +62,11 @@ if exist dist\qc-print-agent.exe (
     echo ======================== >> installers\README.txt
     echo. >> installers\README.txt
     echo Installation: >> installers\README.txt
-    echo 1. Copy qc-print-agent.exe to a folder on your computer >> installers\README.txt
+    echo 1. Copy the qc-print-agent folder to a folder on your computer >> installers\README.txt
     echo 2. Rename .env.example to .env and configure your settings >> installers\README.txt
-    echo 3. Run qc-print-agent.exe --setup to pair with your warehouse >> installers\README.txt
-    echo 4. Run qc-print-agent.exe to start the agent >> installers\README.txt
+    echo 3. Run qc-print-agent\qc-print-agent.exe to pair with your warehouse >> installers\README.txt
+    echo 4. On a clean machine, double-click qc-print-agent\qc-print-agent.exe to open setup automatically >> installers\README.txt
+    echo 5. Use qc-print-agent\qc-print-agent.exe --setup to reopen setup or --reset-pairing to reconfigure >> installers\README.txt
     echo. >> installers\README.txt
     echo For auto-startup on boot, create a Windows Scheduled Task or >> installers\README.txt
     echo place a shortcut in your Startup folder. >> installers\README.txt

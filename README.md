@@ -64,6 +64,36 @@ Get-Content print_agent.log -Wait  # PowerShell
 - ✅ Logs written to file for later review
 - ✅ Graceful shutdown (finishes current jobs before stopping)
 
+## Packaged App Behavior
+
+The packaged app is intended to behave like a real end-user installer:
+
+- On a clean machine, opening the packaged app launches the setup wizard automatically.
+- On an already-paired machine, opening the packaged app skips setup and continues normal startup.
+- Use `--setup` to reopen the setup wizard on any machine.
+- Use `--reset-pairing` to clear local pairing state and relaunch setup without manually deleting app-data files.
+
+### Local State and Logs
+
+- Windows pairing state: `%APPDATA%\QCConnector\state.json`
+- Windows packaged logs: `%APPDATA%\QCConnector\print_agent.log`
+
+If a downloaded packaged build skips the wizard on a developer machine, check whether the machine is already paired. This is expected behavior and not automatically a packaging defect.
+
+### Release Bootstrap Config
+
+Installer artifacts should ship with a bootstrap `.env.example` at the packaged app root.
+
+- Keep the repo `.env.example` placeholder-only.
+- For release builds, inject real bootstrap values in GitHub Actions using repository secrets.
+- Recommended secrets:
+  - `PRINT_AGENT_CALLBACK_URL`
+  - `PRINT_AGENT_API_KEY`
+  - `ERP_AGENT_URL`
+  - `ERP_AGENT_API_KEY`
+
+If those secrets are not configured, the workflow falls back to the placeholder repo template.
+
 ## Firewall Requirements
 
 **IMPORTANT:** The connector requires outbound network access to function properly. Configure your firewall to allow:

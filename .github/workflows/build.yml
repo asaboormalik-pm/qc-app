@@ -52,6 +52,45 @@ jobs:
           echo ""
           echo "=== Build complete ==="
 
+      - name: Generate bootstrap config template
+        run: |
+          if ("${{ secrets.PRINT_AGENT_CALLBACK_URL }}" -and "${{ secrets.PRINT_AGENT_API_KEY }}") {
+            @"
+PRINT_AGENT_CALLBACK_URL=${{ secrets.PRINT_AGENT_CALLBACK_URL }}
+PRINT_AGENT_API_KEY=${{ secrets.PRINT_AGENT_API_KEY }}
+POLL_INTERVAL_SECONDS=2
+PRINTER_PORT=9100
+PRINTER_TIMEOUT_SECONDS=5
+MAX_CONCURRENT_JOBS=3
+LOG_LEVEL=INFO
+ERP_ENABLED=false
+ERP_AUTH_MODE=none
+ERP_ENDPOINTS_JSON={}
+ERP_AUTH_BEARER_TOKEN=
+ERP_AUTH_BASIC_USERNAME=
+ERP_AUTH_BASIC_PASSWORD=
+ERP_AUTH_STATIC_HEADERS_JSON={}
+ERP_DEFAULT_TIMEOUT_SECONDS=10
+ERP_RETRY_ATTEMPTS=0
+ERP_RETRY_BACKOFF_SECONDS=1
+ERP_TIMEOUT_MAX_SECONDS=30
+ERP_RETRY_MAX_ATTEMPTS=3
+ERP_RETRY_BACKOFF_BASE_SECONDS=1
+ERP_RETRY_BACKOFF_MAX_SECONDS=60
+ERP_RETRY_JITTER_SECONDS=1
+ERP_AGENT_ENABLED=false
+ERP_AGENT_URL=${{ secrets.ERP_AGENT_URL }}
+ERP_AGENT_API_KEY=${{ secrets.ERP_AGENT_API_KEY }}
+ERP_AGENT_POLL_INTERVAL_SECONDS=2
+ERP_AGENT_MAX_CONCURRENT_REQUESTS=2
+LOG_FILE=print_agent.log
+WORKSTATION_ID=
+STALE_JOB_TIMEOUT_SECONDS=300
+"@ | Set-Content -Path dist\qc-print-agent\.env.example -Encoding utf8
+          } else {
+            Copy-Item .env.example dist\qc-print-agent\.env.example -Force
+          }
+
       - name: Create ZIP archive
         run: |
           cd dist
@@ -93,21 +132,63 @@ jobs:
       - name: Verify bundled Tcl/Tk files
         run: |
           echo "=== Checking dist folder structure ==="
-          ls -la dist/qc-print-agent/
+          ls -la dist/
+          echo ""
+          echo "=== Checking app bundle ==="
+          ls -la "dist/QC Print Agent.app/Contents/MacOS"
           echo ""
           echo "=== Checking for _internal folder ==="
-          ls -la dist/qc-print-agent/_internal/ | head -20
+          ls -la "dist/QC Print Agent.app/Contents/MacOS/_internal/" | head -20
           echo ""
           echo "=== Checking for Tcl/Tk data folders ==="
-          ls dist/qc-print-agent/_internal/_tcl_data 2>/dev/null || echo "No _tcl_data folder"
-          ls dist/qc-print-agent/_internal/_tk_data 2>/dev/null || echo "No _tk_data folder"
+          ls "dist/QC Print Agent.app/Contents/MacOS/_internal/_tcl_data" 2>/dev/null || echo "No _tcl_data folder"
+          ls "dist/QC Print Agent.app/Contents/MacOS/_internal/_tk_data" 2>/dev/null || echo "No _tk_data folder"
           echo ""
           echo "=== Build complete ==="
+
+      - name: Generate bootstrap config template
+        run: |
+          if [ -n "${{ secrets.PRINT_AGENT_CALLBACK_URL }}" ] && [ -n "${{ secrets.PRINT_AGENT_API_KEY }}" ]; then
+            cat > "dist/QC Print Agent.app/Contents/MacOS/.env.example" <<EOF
+PRINT_AGENT_CALLBACK_URL=${{ secrets.PRINT_AGENT_CALLBACK_URL }}
+PRINT_AGENT_API_KEY=${{ secrets.PRINT_AGENT_API_KEY }}
+POLL_INTERVAL_SECONDS=2
+PRINTER_PORT=9100
+PRINTER_TIMEOUT_SECONDS=5
+MAX_CONCURRENT_JOBS=3
+LOG_LEVEL=INFO
+ERP_ENABLED=false
+ERP_AUTH_MODE=none
+ERP_ENDPOINTS_JSON={}
+ERP_AUTH_BEARER_TOKEN=
+ERP_AUTH_BASIC_USERNAME=
+ERP_AUTH_BASIC_PASSWORD=
+ERP_AUTH_STATIC_HEADERS_JSON={}
+ERP_DEFAULT_TIMEOUT_SECONDS=10
+ERP_RETRY_ATTEMPTS=0
+ERP_RETRY_BACKOFF_SECONDS=1
+ERP_TIMEOUT_MAX_SECONDS=30
+ERP_RETRY_MAX_ATTEMPTS=3
+ERP_RETRY_BACKOFF_BASE_SECONDS=1
+ERP_RETRY_BACKOFF_MAX_SECONDS=60
+ERP_RETRY_JITTER_SECONDS=1
+ERP_AGENT_ENABLED=false
+ERP_AGENT_URL=${{ secrets.ERP_AGENT_URL }}
+ERP_AGENT_API_KEY=${{ secrets.ERP_AGENT_API_KEY }}
+ERP_AGENT_POLL_INTERVAL_SECONDS=2
+ERP_AGENT_MAX_CONCURRENT_REQUESTS=2
+LOG_FILE=print_agent.log
+WORKSTATION_ID=
+STALE_JOB_TIMEOUT_SECONDS=300
+EOF
+          else
+            cp .env.example "dist/QC Print Agent.app/Contents/MacOS/.env.example"
+          fi
 
       - name: Create ZIP archive
         run: |
           cd dist
-          tar -czf qc-print-agent-macos.tar.gz qc-print-agent/
+          tar -czf qc-print-agent-macos.tar.gz "QC Print Agent.app"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

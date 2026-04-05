@@ -28,7 +28,7 @@ rm -rf build dist
 
 # Build with PyInstaller
 echo "Building app bundle..."
-pyinstaller print_agent.spec --clean --windowed
+pyinstaller print_agent.spec --clean
 
 if [ $? -ne 0 ]; then
     echo "ERROR: Build failed"
@@ -37,6 +37,9 @@ fi
 
 # Check if app was created
 if [ -d "dist/QC Print Agent.app" ]; then
+    if [ -f ".env.example" ]; then
+        cp .env.example "dist/QC Print Agent.app/Contents/MacOS/.env.example"
+    fi
     echo ""
     echo "========================================"
     echo "Build successful!"
@@ -51,7 +54,8 @@ if [ -d "dist/QC Print Agent.app" ]; then
     # Create output directory
     mkdir -p installers
 
-    # Copy app to installers directory
+    # Copy app bundle and bootstrap config to installers directory
+    rm -rf "installers/QC Print Agent.app"
     cp -R "dist/QC Print Agent.app" installers/
     cp .env.example installers/
 
@@ -63,8 +67,8 @@ QC Print Agent v1.0.0
 Installation:
 1. Copy QC Print Agent.app to your Applications folder
 2. Rename .env.example to .env and configure your settings
-3. Run QC Print Agent.app --setup to pair with your warehouse
-4. Run QC Print Agent.app to start the agent
+3. On a clean machine, open QC Print Agent.app to launch setup automatically
+4. Use the packaged binary with --setup to reopen setup or --reset-pairing to reconfigure
 
 For auto-startup on boot, create a Launch Agent:
 1. Create ~/Library/LaunchAgents/com.qc.print-agent.plist

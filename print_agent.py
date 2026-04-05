@@ -50,12 +50,7 @@ try:
     test_root.withdraw()
     test_root.destroy()
     TKINTER_AVAILABLE = True
-    print("DEBUG: Tkinter is available and working")
-except Exception as e:
-    print(f"WARNING: Tkinter not available: {e}")
-    import traceback
-    print("DEBUG: Tkinter error traceback:")
-    print(traceback.format_exc())
+except Exception:
     TKINTER_AVAILABLE = False
 
 
@@ -90,6 +85,22 @@ def show_error_message(title: str, message: str) -> None:
         print(f"  {message}")
 
 
+def show_info_message(title: str, message: str) -> None:
+    """Show info message in GUI message box (if available) or console."""
+    if TKINTER_AVAILABLE:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(title, message)
+            root.destroy()
+        except Exception:
+            print(f"{title}")
+            print(f"  {message}")
+    else:
+        print(f"{title}")
+        print(f"  {message}")
+
+
 def get_exe_dir() -> Path:
     """Get the directory containing the executable (for bundled exe) or script (for dev)."""
     if getattr(sys, 'frozen', False):
@@ -113,9 +124,12 @@ def ensure_env_file_exists() -> None:
     exe_dir = get_exe_dir()
     cwd = Path.cwd()
 
+    internal_dir = exe_dir / "_internal"
+
     # Search paths in priority order
     search_paths = [
         exe_dir,           # Where the exe is located
+        internal_dir,      # PyInstaller onedir data files
         cwd,               # Current working directory
     ]
 
@@ -218,23 +232,49 @@ class LocalConfigStore:
         env_file = Path('.env')
         env_vars = []
 
+        if not isinstance(config, dict):
+            logging.warning("save_config_to_env expected dict config, got %s", type(config))
+            return
+
+        def get_config_value(*keys: str) -> Optional[Any]:
+            for key in keys:
+                value = config.get(key)
+                if value not in (None, ""):
+                    return value
+            return None
+
         # Add PRINT_AGENT_CALLBACK_URL
-        if hasattr(config, 'print_agent_url') and config.print_agent_url:
-            env_vars.append(f'PRINT_AGENT_CALLBACK_URL={config.print_agent_url}')
+        print_agent_url = get_config_value("print_agent_url", "printAgentUrl")
+        if not print_agent_url:
+            edge_functions = config.get("edgeFunctions", {})
+            if isinstance(edge_functions, dict):
+                print_agent_url = edge_functions.get("sharedUrl") or edge_functions.get("printAgentUrl")
+        if print_agent_url:
+            env_vars.append(f'PRINT_AGENT_CALLBACK_URL={print_agent_url}')
 
         # Add PRINT_AGENT_API_KEY
-        if hasattr(config, 'print_agent_api_key') and config.print_agent_api_key:
-            env_vars.append(f'PRINT_AGENT_API_KEY={config.print_agent_api_key}')
+        print_agent_api_key = get_config_value("print_agent_api_key", "printAgentApiKey", "apiKey")
+        if not print_agent_api_key:
+            edge_functions = config.get("edgeFunctions", {})
+            if isinstance(edge_functions, dict):
+                print_agent_api_key = edge_functions.get("apiKey")
+        if print_agent_api_key:
+            env_vars.append(f'PRINT_AGENT_API_KEY={print_agent_api_key}')
 
         # Add other non-secret settings
-        if hasattr(config, 'poll_interval_seconds'):
-            env_vars.append(f'POLL_INTERVAL_SECONDS={config.poll_interval_seconds}')
-        if hasattr(config, 'max_concurrent_jobs'):
-            env_vars.append(f'MAX_CONCURRENT_JOBS={config.max_concurrent_jobs}')
-        if hasattr(config, 'printer_port'):
-            env_vars.append(f'PRINTER_PORT={config.printer_port}')
-        if hasattr(config, 'printer_timeout_seconds'):
-            env_vars.append(f'PRINTER_TIMEOUT_SECONDS={config.printer_timeout_seconds}')
+        poll_interval_seconds = get_config_value("poll_interval_seconds")
+        max_concurrent_jobs = get_config_value("max_concurrent_jobs")
+        printer_port = get_config_value("printer_port")
+        printer_timeout_seconds = get_config_value("printer_timeout_seconds")
+
+        if poll_interval_seconds is not None:
+            env_vars.append(f'POLL_INTERVAL_SECONDS={poll_interval_seconds}')
+        if max_concurrent_jobs is not None:
+            env_vars.append(f'MAX_CONCURRENT_JOBS={max_concurrent_jobs}')
+        if printer_port is not None:
+            env_vars.append(f'PRINTER_PORT={printer_port}')
+        if printer_timeout_seconds is not None:
+            env_vars.append(f'PRINTER_TIMEOUT_SECONDS={printer_timeout_seconds}')
 
         if env_vars:
             with open(env_file, 'w', encoding='utf-8') as f:
@@ -303,8 +343,19 @@ class LocalConfigStore:
         state["is_paired"] = False
         state["paired_at"] = None
         state["warehouse_id"] = None
+        state["station_name"] = None
         self.save_state(state)
         logging.info("[CONNECTOR] Paired state reset - device unpaired from server")
+
+    def clear_local_runtime_state(self) -> None:
+        """Remove cached local files that should not survive a reset flow."""
+        for path in (self.config_file, self.pid_file):
+            try:
+                if path.exists():
+                    path.unlink()
+                    logging.info("Removed local runtime file: %s", path)
+            except Exception as exc:
+                logging.warning("Could not remove local runtime file %s: %s", path, exc)
 
     def _strip_secrets(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Remove secrets from config before saving to JSON."""
@@ -941,14 +992,9 @@ class SetupWizard:
                 "Please use console mode: qc-print-agent.exe --console"
             )
 
-        print("DEBUG: Creating Tkinter root window...")
         try:
             self.root = tk.Tk()
-            print("DEBUG: Tkinter root created successfully")
         except Exception as e:
-            print(f"ERROR: Failed to create Tkinter root: {e}")
-            import traceback
-            print(traceback.format_exc())
             raise RuntimeError(
                 f"Failed to create GUI window: {e}\n\n"
                 "The Tkinter library cannot initialize.\n"
@@ -956,11 +1002,13 @@ class SetupWizard:
             )
 
         self.connector = connector_manager
+        self.paired_successfully = False
+        self.close_reason = "unknown"
         self.root.title("QC Connector Setup")
         self.root.geometry("500x400")
         self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
-        print("DEBUG: Creating widgets...")
         self.create_widgets()
 
         # Ensure window is visible and on top
@@ -968,9 +1016,6 @@ class SetupWizard:
         self.root.attributes('-topmost', True)
         self.root.after_idle(self.root.attributes, '-topmost', False)
         self.root.focus_force()
-
-        print("DEBUG: Setup wizard initialized")
-
     def create_widgets(self):
         # Header
         header = ttk.Label(self.root, text="Connect to Warehouse", font=("Helvetica", 16, "bold"))
@@ -1031,6 +1076,8 @@ class SetupWizard:
 
         if result.get("success"):
             station_name = result.get("stationName", "Unknown")
+            self.paired_successfully = True
+            self.close_reason = "success"
             messagebox.showinfo(
                 "Success",
                 f"Successfully paired to {station_name}!\n\n"
@@ -1043,11 +1090,19 @@ class SetupWizard:
             self.status_label.config(text="")
 
     def on_cancel(self):
+        if not self.paired_successfully:
+            self.close_reason = "cancel"
         self.root.destroy()
 
-    def run(self):
+    def on_window_close(self):
+        if not self.paired_successfully:
+            self.close_reason = "window_close"
+        self.root.destroy()
+
+    def run(self) -> bool:
         """Start the Tkinter main loop."""
         self.root.mainloop()
+        return self.paired_successfully
 
 
 def console_pairing(connector_manager: ConnectorManager) -> bool:
@@ -2293,13 +2348,14 @@ class PrintAgent:
             response = self._send_erp_http_request(
                 endpoint_key=endpoint_key,
                 payload=test_payload,
-                request_id=str(uuid.uuid4()),
+                correlation_id=str(uuid.uuid4()),
+                idempotency_key=str(uuid.uuid4()),
             )
 
-            if response.get("response_code") == 200:
+            if response.get("status_code") == 200:
                 return {"success": True, "message": f"Connected to {endpoint.url}"}
             else:
-                return {"success": False, "error": f"HTTP {response.get('response_code')}"}
+                return {"success": False, "error": f"HTTP {response.get('status_code')}"}
 
         except requests.exceptions.Timeout:
             return {"success": False, "error": "Connection timeout"}
@@ -2330,6 +2386,7 @@ def load_dotenv(path: str = ".env") -> None:
     if getattr(sys, 'frozen', False):
         # Running as bundled exe - check exe directory
         search_paths.append(Path(sys.executable).parent / '.env')
+        search_paths.append(Path(sys.executable).parent / '_internal' / '.env')
     # Check current working directory
     search_paths.append(Path.cwd() / '.env')
 
@@ -2347,8 +2404,14 @@ def _load_env_file(path: Path) -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            print(f"Loading env var from .env: {key.strip()}={value.strip()}")
-            os.environ[key.strip()] = value.strip().strip('"').strip("'")
+            cleaned_key = key.strip()
+            cleaned_value = value.strip().strip('"').strip("'")
+            logging.info(
+                "Loading env var from .env: %s=%s",
+                cleaned_key,
+                _sanitize_env_value_for_log(cleaned_key, cleaned_value),
+            )
+            os.environ[cleaned_key] = cleaned_value
 
 # https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent
 
@@ -2770,22 +2833,166 @@ def setup_logging(daemon: bool = False) -> None:
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     log_format = "%(asctime)s %(levelname)s %(message)s"
 
-    if daemon:
+    store = LocalConfigStore()
+    if daemon or getattr(sys, "frozen", False):
         # Background mode: log to file
-        log_file = os.getenv("LOG_FILE", "print_agent.log")
+        log_file = Path(os.getenv("LOG_FILE", str(store.get_log_path())))
+        if not log_file.is_absolute():
+            log_file = store.app_data_dir / log_file
+        log_file.parent.mkdir(parents=True, exist_ok=True)
         logging.basicConfig(
             level=log_level,
             format=log_format,
             filename=log_file,
             filemode="a",  # Append mode
+            force=True,
         )
-        logging.info("Background mode started - logging to file: %s", log_file)
+        logging.info("File logging started - logging to file: %s", log_file)
     else:
         # Foreground mode: log to console
         logging.basicConfig(
             level=log_level,
             format=log_format,
+            force=True,
         )
+
+
+def setup_startup_logging(force_file: bool = False) -> Path:
+    """Initialize logging early so startup branch decisions are captured."""
+    store = LocalConfigStore()
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_format = "%(asctime)s %(levelname)s %(message)s"
+    handlers: List[logging.Handler] = []
+
+    if force_file:
+        log_file = Path(os.getenv("LOG_FILE", str(store.get_log_path())))
+        if not log_file.is_absolute():
+            log_file = store.app_data_dir / log_file
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
+    else:
+        handlers.append(logging.StreamHandler())
+
+    logging.basicConfig(level=log_level, format=log_format, handlers=handlers, force=True)
+    logging.info(
+        "Startup logging initialized mode=%s frozen=%s app_data_dir=%s cwd=%s exe_dir=%s",
+        "file" if force_file else "console",
+        getattr(sys, "frozen", False),
+        store.app_data_dir,
+        Path.cwd(),
+        get_exe_dir(),
+    )
+    return store.get_log_path()
+
+
+def _clear_connector_secrets() -> None:
+    secure = SecureStorage()
+    secure.clear_all()
+    logging.info("Cleared connector secrets from secure storage")
+
+
+def _sanitize_env_value_for_log(key: str, value: str) -> str:
+    sensitive_markers = ("key", "token", "password", "secret", "authorization")
+    if any(marker in key.lower() for marker in sensitive_markers):
+        return "[redacted]"
+    if len(value) > 200:
+        return f"{value[:200]}... [truncated]"
+    return value
+
+
+def _resolve_bootstrap_pairing_config() -> Config:
+    """Load and validate the bootstrap config required to relaunch setup."""
+    ensure_env_file_exists()
+    try:
+        config = _load_legacy_env_config()
+    except Exception as exc:
+        raise ConfigError(f"Bootstrap config is unavailable: {exc}") from exc
+
+    if not config.print_agent_url or not config.print_agent_api_key:
+        raise ConfigError("Bootstrap config must include PRINT_AGENT_CALLBACK_URL and PRINT_AGENT_API_KEY")
+
+    return config
+
+
+def _clear_local_pairing_state(store: LocalConfigStore) -> None:
+    """Clear paired local state and cached secrets/runtime files."""
+    store.reset_paired_state()
+    store.clear_local_runtime_state()
+    _clear_connector_secrets()
+    logging.info("Cleared local pairing state and runtime files")
+
+
+def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str, success_message: Optional[str] = None) -> None:
+    logging.info("Setup wizard path selected reason=%s console=%s tkinter=%s", reason, args.console, TKINTER_AVAILABLE)
+
+    if args.console:
+        print("\n=== CONSOLE MODE PAIRING ===\n")
+        if console_pairing(manager):
+            logging.info("Console pairing completed successfully")
+            if success_message:
+                print(success_message)
+            pause_for_debug()
+            sys.exit(0)
+        logging.error("Console pairing failed")
+        pause_for_debug()
+        sys.exit(1)
+
+    if not TKINTER_AVAILABLE:
+        logging.error("Setup requested but Tkinter is unavailable")
+        show_error_message(
+            "Setup Wizard Error",
+            "Tkinter GUI is not available.\n\nThe setup wizard requires Tkinter.\n\nPlease use --console or contact support.",
+        )
+        sys.exit(1)
+
+    try:
+        wizard = SetupWizard(manager)
+        paired_successfully = wizard.run()
+        if paired_successfully:
+            logging.info("GUI setup wizard completed successfully")
+            if success_message:
+                show_info_message("Setup Complete", success_message)
+            sys.exit(0)
+
+        logging.warning("GUI setup wizard exited without pairing close_reason=%s", wizard.close_reason)
+        sys.exit(1)
+    except Exception as exc:
+        logging.exception("GUI setup wizard failed, falling back to console: %s", exc)
+        print(f"\nGUI setup wizard failed: {exc}")
+        print("\nFalling back to console-based pairing...\n")
+        if console_pairing(manager):
+            logging.info("Console pairing fallback completed successfully")
+            sys.exit(0)
+        logging.error("Console pairing fallback failed")
+        sys.exit(1)
+
+
+def _reset_pairing_state(args: Any) -> None:
+    store = LocalConfigStore()
+    setup_startup_logging(force_file=getattr(sys, "frozen", False))
+    logging.info("Reset pairing requested")
+
+    if check_pid_file():
+        logging.error("Reset pairing refused because another instance is already running")
+        print("ERROR: Another instance is already running.")
+        print("Use --stop to stop the existing instance first.")
+        sys.exit(1)
+
+    try:
+        bootstrap_config = _resolve_bootstrap_pairing_config()
+    except Exception as exc:
+        logging.error("Reset pairing refused because bootstrap validation failed: %s", exc)
+        print(f"ERROR: Cannot reset pairing because bootstrap configuration is invalid: {exc}")
+        sys.exit(1)
+
+    _clear_local_pairing_state(store)
+    manager = ConnectorManager(bootstrap_config.print_agent_url, bootstrap_config.print_agent_api_key)
+    _launch_setup_wizard(
+        manager,
+        args,
+        reason="explicit-reset-pairing",
+        success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.\n\nFor background mode, use: qc-print-agent.exe --daemon",
+    )
 
 
      
@@ -2819,6 +3026,11 @@ def main() -> None:
         help="Launch first-run setup wizard for pairing"
     )
     parser.add_argument(
+        "--reset-pairing",
+        action="store_true",
+        help="Clear local pairing state and relaunch setup"
+    )
+    parser.add_argument(
         "--console",
         action="store_true",
         help="Use console-based pairing instead of GUI"
@@ -2835,6 +3047,16 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # Load .env before logging so log-file configuration is available early.
+    load_dotenv()
+    startup_log_path = setup_startup_logging(force_file=getattr(sys, "frozen", False) and not args.console)
+    logging.info(
+        "Process startup frozen=%s args=%s startup_log=%s",
+        getattr(sys, "frozen", False),
+        vars(args),
+        startup_log_path,
+    )
 
     # Handle --stop command
     if args.stop:
@@ -2885,52 +3107,26 @@ def main() -> None:
             print("Print agent is not running")
         return
 
+    if args.reset_pairing:
+        _reset_pairing_state(args)
+        return
+
     # NEW: Handle --setup command
     if args.setup:
-        # Check if console mode is requested
-        if args.console:
-            print("\n=== CONSOLE MODE PAIRING ===\n")
-            try:
-                config = load_config()
-                manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
-                if console_pairing(manager):
-                    print("\nPairing successful! You can now run the agent normally.")
-                    pause_for_debug()
-                    sys.exit(0)
-                else:
-                    print("\nPairing failed.")
-                    pause_for_debug()
-                    sys.exit(1)
-            except Exception as exc:
-                print(f"\nSetup error: {exc}")
-                pause_for_debug()
-                sys.exit(1)
-            return
-
-        # GUI mode
         try:
             config = load_config()
             manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
-            wizard = SetupWizard(manager)
-            wizard.run()
+            _launch_setup_wizard(
+                manager,
+                args,
+                reason="explicit-setup",
+                success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.\n\nFor background mode, use: qc-print-agent.exe --daemon",
+            )
         except Exception as exc:
-            print(f"\nSetup wizard error: {exc}")
-            print("\nFalling back to console mode...")
-            try:
-                config = load_config()
-                manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
-                if console_pairing(manager):
-                    print("\nPairing successful via console!")
-                    pause_for_debug()
-                    sys.exit(0)
-                else:
-                    print("\nPairing failed.")
-                    pause_for_debug()
-                    sys.exit(1)
-            except Exception as console_exc:
-                print(f"\nConsole setup also failed: {console_exc}")
-                pause_for_debug()
-                sys.exit(1)
+            logging.exception("Explicit setup failed before wizard launch: %s", exc)
+            print(f"\nSetup error: {exc}")
+            pause_for_debug()
+            sys.exit(1)
         return
 
     # NEW: Handle --test-print command
@@ -2961,7 +3157,16 @@ def main() -> None:
 
     # Check if connector is paired - if not, launch setup wizard automatically
     store = LocalConfigStore()
+    logging.info(
+        "Resolved startup state app_data_dir=%s state_path=%s config_path=%s log_path=%s paired=%s",
+        store.app_data_dir,
+        store.state_file,
+        store.config_file,
+        store.get_log_path(),
+        store.is_paired(),
+    )
     if not store.is_paired():
+        logging.info("First-run setup branch selected")
         print("QC Print Agent - First Run Setup")
         print("=" * 40)
         print("This appears to be your first time running the agent.")
@@ -2970,14 +3175,6 @@ def main() -> None:
 
         # Ensure .env file exists (create from .env.example or minimal defaults)
         ensure_env_file_exists()
-
-        # Debug logging
-        state = store.load_state()
-        print(f"DEBUG: is_paired={store.is_paired()}")
-        print(f"DEBUG: Paired state: {state.get('is_paired')}")
-        print(f"DEBUG: Workstation ID: {store.get_workstation_id()}")
-        print(f"DEBUG: Tkinter available: {TKINTER_AVAILABLE}")
-        print()
 
         # Check if tkinter is available
         if not TKINTER_AVAILABLE:
@@ -2990,35 +3187,20 @@ def main() -> None:
         try:
             config = load_config()
             manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
-            wizard = SetupWizard(manager)
-            wizard.run()
-            # After setup completes, exit - user needs to restart the agent
-            show_error_message(
-                "Setup Complete",
-                "Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.\n\nFor background mode, use: qc-print-agent.exe --daemon"
+            _launch_setup_wizard(
+                manager,
+                args,
+                reason="auto-first-run",
+                success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.\n\nFor background mode, use: qc-print-agent.exe --daemon",
             )
-            sys.exit(0)
         except Exception as exc:
-            import traceback
-            error_details = f"{exc}\n\n{traceback.format_exc()}"
-            print(f"\nGUI setup wizard failed: {error_details}")
-            print("\nFalling back to console-based pairing...\n")
-
-            # Fallback to console-based pairing
-            try:
-                config = load_config()
-                manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
-                if console_pairing(manager):
-                    sys.exit(0)
-                else:
-                    print("\nPairing failed. Please try again or contact support.")
-                    sys.exit(1)
-            except Exception as console_exc:
-                print(f"\nConsole pairing also failed: {console_exc}")
-                sys.exit(1)
+            logging.exception("Auto first-run setup failed before wizard launch: %s", exc)
+            print(f"\nSetup failed: {exc}")
+            sys.exit(1)
 
     # Device is paired locally - verify it's still registered on server
     # (handles case where device was unpaired from frontend)
+    logging.info("Already-paired startup branch selected")
     print("QC Print Agent - Verifying registration...")
     try:
         config = load_config()
@@ -3029,41 +3211,19 @@ def main() -> None:
             print("Resetting local state and launching setup wizard...")
             print()
 
-            # Reset paired state
-            store.reset_paired_state()
-
-            # Clear control-plane token from keychain
-            manager.secure.set_control_plane_token("")
+            _clear_local_pairing_state(store)
 
             # Launch setup wizard
             ensure_env_file_exists()
-
-            if not TKINTER_AVAILABLE:
-                # Use console pairing directly
-                print("Tkinter GUI not available. Using console-based pairing...\n")
-                if console_pairing(manager):
-                    sys.exit(0)
-                else:
-                    sys.exit(1)
-
-            try:
-                wizard = SetupWizard(manager)
-                wizard.run()
-            except Exception as gui_exc:
-                print(f"\nGUI setup wizard failed: {gui_exc}")
-                print("\nFalling back to console-based pairing...\n")
-                if console_pairing(manager):
-                    sys.exit(0)
-                else:
-                    sys.exit(1)
-
-            show_error_message(
-                "Setup Complete",
-                "Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs."
+            _launch_setup_wizard(
+                manager,
+                args,
+                reason="registration-reset",
+                success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.",
             )
-            sys.exit(0)
     except Exception as exc:
         # On network errors, continue anyway (might be temporary)
+        logging.warning("Registration verification failed, continuing with local state: %s", exc)
         print(f"Warning: Could not verify registration: {exc}")
         print("Continuing with local state...")
         print()
@@ -3076,6 +3236,12 @@ def main() -> None:
 
     # Setup logging based on mode
     setup_logging(daemon=args.daemon)
+    logging.info(
+        "Runtime logging configured mode=%s frozen=%s paired=%s",
+        "daemon" if args.daemon else ("packaged-gui" if getattr(sys, "frozen", False) else "console"),
+        getattr(sys, "frozen", False),
+        store.is_paired(),
+    )
 
     # Register PID file cleanup on exit
     atexit.register(remove_pid_file)
