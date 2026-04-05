@@ -4,9 +4,9 @@ PyInstaller spec file for QC Print Agent.
 
 Builds a standalone executable for Windows (.exe) or macOS (.app).
 
-Usage:
-    Windows: pyinstaller print_agent.spec
-    macOS:   pyinstaller --windowed print_agent.spec
+IMPORTANT: Uses --onedir mode (directory with supporting files)
+instead of --onefile (single exe). This is required for Tkinter to work
+because Tcl/Tk needs access to its supporting files at runtime.
 """
 
 import sys
@@ -21,7 +21,7 @@ is_macos = sys.platform.startswith('darwin')
 block_cipher = None
 icon_file = None
 
-# Icon paths (optional - add your icons later)
+# Icon paths
 if is_windows:
     icon_file = 'assets/icon.ico' if Path('assets/icon.ico').exists() else None
 elif is_macos:
@@ -34,11 +34,11 @@ hiddenimports = [
     'keyring.backends.kwallet',
     'requests',
     'urllib3',
-    # Tkinter for setup wizard - collect all submodules
+    # Tkinter - collect ALL submodules
     *collect_submodules('tkinter'),
 ]
 
-# Data files to include (templates, configs, etc.)
+# Data files to include
 datas = [
     ('.env.example', '.'),
 ]
@@ -46,59 +46,24 @@ datas = [
 # Binary files to include
 binaries = []
 
-# CRITICAL: Collect Tcl/Tk binaries and data files for GUI
-# This ensures the setup wizard works in the bundled executable
+# CRITICAL: Tcl/Tk support for GUI
+# PyInstaller's hooks should handle this, but we explicitly collect them
 if is_windows:
-    # Use PyInstaller's built-in data collection for tkinter
-    # This automatically finds and bundles Tcl/Tk DLLs and support files
+    # Collect tkinter data files (includes Tcl/Tk DLLs and supporting files)
     try:
         tkinter_datas = collect_data_files('tkinter', include_py_files=False)
         datas.extend(tkinter_datas)
+        print(f"[PyInstaller] Collected {len(tkinter_datas)} tkinter data files")
     except Exception as e:
-        print(f"Warning: Could not collect tkinter data files: {e}")
+        print(f"[PyInstaller] Warning: Could not collect tkinter data: {e}")
 
-    # Also try to collect _tkinter module data
+    # Also collect _tkinter
     try:
         tk_datas = collect_data_files('_tkinter', include_py_files=False)
         datas.extend(tk_datas)
+        print(f"[PyInstaller] Collected {len(tk_datas)} _tkinter data files")
     except Exception as e:
-        print(f"Warning: Could not collect _tkinter data files: {e}")
-
-    # Explicitly collect Tcl/Tk DLLs from common locations
-    # This handles different Python distributions
-    tcl_dll_names = ['tcl86t.dll', 'tk86t.dll', 'tcl86.dll', 'tk86.dll',
-                     'tcl87t.dll', 'tk87t.dll', 'tcl87.dll', 'tk87.dll',
-                     'tcl88t.dll', 'tk88t.dll', 'tcl88.dll', 'tk88.dll',
-                     'tcl89t.dll', 'tk89t.dll', 'tcl89.dll', 'tk89.dll']
-
-    # Search in standard locations
-    search_paths = [
-        Path(sys.prefix) / 'DLLs',
-        Path(sys.base_prefix) / 'DLLs',
-        Path(sys.executable).parent / 'DLLs',
-    ]
-
-    for dll_name in tcl_dll_names:
-        for search_path in search_paths:
-            dll_path = search_path / dll_name
-            if dll_path.exists():
-                binaries.append((str(dll_path), '.'))
-                break
-
-    # Try to collect the tcl directory with supporting files
-    tcl_search_paths = [
-        Path(sys.prefix) / 'tcl',
-        Path(sys.base_prefix) / 'tcl',
-        Path(sys.executable).parent / 'tcl',
-    ]
-
-    for tcl_path in tcl_search_paths:
-        if tcl_path.exists() and tcl_path.is_dir():
-            try:
-                datas.append((str(tcl_path), 'tcl'))
-                break
-            except Exception:
-                pass
+        print(f"[PyInstaller] Warning: Could not collect _tkinter data: {e}")
 
 a = Analysis(
     ['print_agent.py'],
@@ -110,7 +75,6 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # 'tkinter',  # INCLUDED - needed for setup wizard
         'matplotlib',
         'numpy',
         'pandas',
@@ -125,13 +89,14 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# NOTE: Using onedir mode (directory with exe + supporting files)
+# This is REQUIRED for Tkinter to work because Tcl/Tk needs access
+# to its supporting files at runtime.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    [],
+    [],  # Exclude binaries from exe (they go in the folder)
+    exclude_binaries=True,  # CRITICAL: onedir mode
     name='qc-print-agent',
     debug=False,
     bootloader_ignore_signals=False,
@@ -139,7 +104,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,  # Keep console for debugging - can change to False later
+    console=True,  # Keep console for now (can change to False after testing)
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -148,7 +113,19 @@ exe = EXE(
     icon=icon_file,
 )
 
-# macOS: Create .app bundle (in addition to standalone executable)
+# Collect all binaries and data files into the dist folder
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='qc-print-agent',
+)
+
+# macOS: Create .app bundle from the collected folder
 if is_macos:
     app = BUNDLE(
         exe,
@@ -160,6 +137,6 @@ if is_macos:
             'CFBundleDisplayName': 'QC Print Agent',
             'CFBundleVersion': '1.0.0',
             'CFBundleShortVersionString': '1.0.0',
-            'LSUIElement': True,  # Run as background agent (no dock icon)
+            'LSUIElement': True,
         },
     )
