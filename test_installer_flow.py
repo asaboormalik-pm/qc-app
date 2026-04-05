@@ -77,6 +77,46 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertIn("POLL_INTERVAL_SECONDS=5", env_text)
         self.assertIn("PRINTER_PORT=9109", env_text)
 
+    def test_pair_with_code_persists_backend_workstation_id_to_state(self) -> None:
+        app_dir = Path("test-output-pair-state")
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        app_dir.mkdir(parents=True)
+
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "success": True,
+            "config": {
+                "edgeFunctions": {
+                    "sharedUrl": "https://example.com/functions/v1/print-agent",
+                    "apiKey": "shared-key",
+                }
+            },
+            "controlPlaneToken": "control-token",
+            "workstationId": "backend-ws-123",
+            "warehouseId": "warehouse-1",
+            "stationName": "Station A",
+        }
+
+        try:
+            with patch.object(LocalConfigStore, "get_app_data_dir", return_value=app_dir), \
+                 patch.object(print_agent.requests, "post", return_value=response), \
+                 patch.object(print_agent.SecureStorage, "set_control_plane_token"), \
+                 patch.object(print_agent.ConnectorManager, "_store_secrets"), \
+                 patch.object(print_agent.LocalConfigStore, "save_config_to_env"):
+                manager = print_agent.ConnectorManager("https://example.com/functions/v1/print-agent", "shared-key")
+                result = manager.pair_with_code("ABC123")
+                saved_state = manager.store.load_state()
+        finally:
+            if app_dir.exists():
+                shutil.rmtree(app_dir)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(saved_state["workstation_id"], "backend-ws-123")
+        self.assertTrue(saved_state["is_paired"])
+        self.assertEqual(saved_state["connection_status"], "paired_active")
+
     def test_sanitize_env_value_for_log_redacts_sensitive_values(self) -> None:
         self.assertEqual(print_agent._sanitize_env_value_for_log("PRINT_AGENT_API_KEY", "secret-value"), "[redacted]")
         self.assertEqual(print_agent._sanitize_env_value_for_log("ERP_AUTH_BASIC_PASSWORD", "secret-pass"), "[redacted]")

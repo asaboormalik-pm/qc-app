@@ -868,6 +868,7 @@ class ConnectorManager:
                     workstation_id = data.get("workstationId")
                     if workstation_id:
                         self.workstation_id = workstation_id
+                        self.state["workstation_id"] = workstation_id
                         self.store.save_workstation_id(workstation_id)
 
                     # Update pairing state
