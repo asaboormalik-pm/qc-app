@@ -56,15 +56,20 @@ except Exception:
 
 def pause_for_debug():
     """Pause execution so user can read console messages (only in bundled exe)."""
-    if getattr(sys, 'frozen', False):
-        # Running as bundled executable
-        print()
-        print("=" * 60)
-        print("Press Enter to exit...")
-        try:
-            input()
-        except (EOFError, KeyboardInterrupt):
-            pass
+    if not getattr(sys, 'frozen', False):
+        return
+
+    stdin = getattr(sys, "stdin", None)
+    if stdin is None or not hasattr(stdin, "isatty") or not stdin.isatty():
+        return
+
+    print()
+    print("=" * 60)
+    print("Press Enter to exit...")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 def show_error_message(title: str, message: str) -> None:
@@ -111,8 +116,30 @@ def get_exe_dir() -> Path:
         return Path.cwd()
 
 
+def _read_env_file_values(path: Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    with open(path, "r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+
+    return values
+
+
+def _bootstrap_env_is_valid(path: Path) -> bool:
+    values = _read_env_file_values(path)
+    required_keys = ("PRINT_AGENT_CALLBACK_URL", "PRINT_AGENT_API_KEY")
+    return all(values.get(key, "").strip() for key in required_keys)
+
+
 def ensure_env_file_exists() -> None:
-    """Create .env file from .env.example if it doesn't exist.
+    """Create or heal .env from .env.example when bootstrap config is missing.
 
     Searches in multiple locations:
     1. Exe directory (for bundled apps)
@@ -139,15 +166,18 @@ def ensure_env_file_exists() -> None:
     for search_path in search_paths:
         test_env = search_path / '.env'
         test_example = search_path / '.env.example'
+        if test_example.exists() and env_example is None:
+            env_example = test_example
         if test_env.exists():
             env_file = test_env
             break
-        if test_example.exists():
-            env_example = test_example
 
-    # If .env already exists, we're done
+    should_heal_existing = getattr(sys, "frozen", False)
+
     if env_file and env_file.exists():
-        return
+        if not should_heal_existing or _bootstrap_env_is_valid(env_file):
+            return
+        logging.warning("Existing packaged .env is missing required bootstrap keys; regenerating from .env.example")
 
     # Determine where to create .env (prefer exe directory)
     target_dir = exe_dir if exe_dir.exists() else cwd
@@ -157,7 +187,9 @@ def ensure_env_file_exists() -> None:
     if env_example and env_example.exists():
         import shutil
         shutil.copy(env_example, env_file)
-        print(f"[CONFIG] Created .env file from .env.example at: {env_file}")
+        if not _bootstrap_env_is_valid(env_file):
+            raise ConfigError(f"Packaged bootstrap template is invalid: {env_example}")
+        logging.info("Prepared bootstrap .env from template at %s", env_example)
     else:
         # Create a minimal .env file with required variables
         minimal_env = """# QC Print Agent Configuration
@@ -179,16 +211,12 @@ MAX_CONCURRENT_JOBS=3
 """
         with open(env_file, 'w') as f:
             f.write(minimal_env)
-        print(f"[CONFIG] Created .env file with default configuration at: {env_file}")
-
-    print()
-    print("IMPORTANT: The pairing wizard will automatically configure these values.")
-    print("            Just enter your pairing code and click Connect.")
-    print()
+        logging.warning("Created fallback bootstrap .env with placeholder values at: %s", env_file)
 
 
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_CALLBACK_RETRIES = 3
+REMOTE_UNPAIRED_EVENT = threading.Event()
 
 
 class ConfigError(Exception):
@@ -300,12 +328,17 @@ class LocalConfigStore:
         """Load runtime state, creating default if missing."""
         if self.state_file.exists():
             with open(self.state_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                state = json.load(f)
+            if "connection_status" not in state:
+                state["connection_status"] = "paired_active" if state.get("is_paired") else "not_paired"
+                self.save_state(state)
+            return state
 
         # Default state - generate workstation ID once
         default_state = {
             "workstation_id": str(uuid.uuid4()),
             "is_paired": False,
+            "connection_status": "not_paired",
             "paired_at": None,
             "warehouse_id": None,
             "station_name": None
@@ -329,6 +362,11 @@ class LocalConfigStore:
         state["workstation_id"] = workstation_id
         self.save_state(state)
 
+    def set_connection_status(self, connection_status: str) -> None:
+        state = self.load_state()
+        state["connection_status"] = connection_status
+        self.save_state(state)
+
     def get_log_path(self) -> Path:
         """Get log file path in app-data directory."""
         return self.log_file
@@ -341,15 +379,31 @@ class LocalConfigStore:
         """Reset paired state - called when device is unpaired from server."""
         state = self.load_state()
         state["is_paired"] = False
+        state["connection_status"] = "not_paired"
         state["paired_at"] = None
         state["warehouse_id"] = None
         state["station_name"] = None
         self.save_state(state)
         logging.info("[CONNECTOR] Paired state reset - device unpaired from server")
 
-    def clear_local_runtime_state(self) -> None:
+    def mark_server_unpaired(self, reason: Optional[str] = None) -> None:
+        state = self.load_state()
+        state["is_paired"] = False
+        state["connection_status"] = "server_unpaired"
+        state["paired_at"] = None
+        state["warehouse_id"] = None
+        state["station_name"] = None
+        if reason:
+            state["disconnect_reason"] = reason
+        self.save_state(state)
+        logging.info("[CONNECTOR] Marked connector as server_unpaired reason=%s", reason or "unknown")
+
+    def clear_local_runtime_state(self, include_pid_file: bool = True) -> None:
         """Remove cached local files that should not survive a reset flow."""
-        for path in (self.config_file, self.pid_file):
+        paths = [self.config_file]
+        if include_pid_file:
+            paths.append(self.pid_file)
+        for path in paths:
             try:
                 if path.exists():
                     path.unlink()
@@ -818,9 +872,11 @@ class ConnectorManager:
 
                     # Update pairing state
                     self.state["is_paired"] = True
+                    self.state["connection_status"] = "paired_active"
                     self.state["paired_at"] = datetime.now(timezone.utc).isoformat()
                     self.state["warehouse_id"] = data.get("warehouseId")
                     self.state["station_name"] = data.get("stationName") or data.get("station_name")
+                    self.state.pop("disconnect_reason", None)
                     self.store.save_state(self.state)
 
                     logging.info(f"[CONNECTOR] Successfully paired to {data.get('stationName', 'Unknown')} (workstation: {workstation_id})")
@@ -865,6 +921,13 @@ class ConnectorManager:
                 timeout=10
             )
 
+            status = self._classify_registration_response(response)
+            if status == "unpaired":
+                logging.warning("[CONNECTOR] Config fetch reported unpaired state")
+                return {"status": "unpaired"}
+            if status == "revoked":
+                logging.error("[CONNECTOR] Control-plane token invalid or expired")
+                return {"status": "revoked"}
             if response.status_code == 200:
                 data = response.json()
                 config = data.get("config")
@@ -877,9 +940,6 @@ class ConnectorManager:
 
                 logging.info("[CONNECTOR] Config refreshed from backend")
                 return config
-
-            elif response.status_code == 401:
-                logging.error("[CONNECTOR] Control-plane token invalid or expired")
             else:
                 logging.warning(f"[CONNECTOR] Config fetch failed: {response.status_code}")
 
@@ -888,12 +948,12 @@ class ConnectorManager:
 
         return None
 
-    def send_heartbeat(self, status: str = "online", error: str = None) -> None:
+    def send_heartbeat(self, status: str = "online", error: str = None) -> str:
         """Send heartbeat to backend."""
 
         control_plane_token = self.secure.get_control_plane_token()
         if not control_plane_token:
-            return
+            return "revoked"
 
         payload = {
             "workstationId": self.workstation_id,
@@ -904,7 +964,7 @@ class ConnectorManager:
         }
 
         try:
-            requests.post(
+            response = requests.post(
                 f"{self.api_base}?action=heartbeat",
                 headers={
                     "X-API-Key": self.shared_api_key,
@@ -914,23 +974,92 @@ class ConnectorManager:
                 json=payload,
                 timeout=5
             )
+            return self._classify_registration_response(response)
         except Exception as e:
             logging.warning(f"[CONNECTOR] Heartbeat failed: {e}")
+            return "transient"
 
     def run_heartbeat_loop(self) -> None:
         """Background thread sending heartbeat every 30 seconds."""
         while True:
-            self.send_heartbeat("online")
+            heartbeat_status = self.send_heartbeat("online")
+            if heartbeat_status in {"unpaired", "revoked"}:
+                self.handle_remote_disconnect(
+                    "device_unpaired_by_admin" if heartbeat_status == "unpaired" else "device_registration_revoked"
+                )
+                return
             time.sleep(30)
+
+    def _classify_registration_response(self, response: requests.Response) -> str:
+        if response.status_code == 401:
+            return "revoked"
+
+        if response.status_code != 200:
+            return "transient"
+
+        try:
+            body = response.json()
+        except ValueError:
+            return "connected"
+
+        if isinstance(body, dict) and body.get("status") == "unpaired":
+            return "unpaired"
+
+        return "connected"
+
+    def acknowledge_unpair(self) -> bool:
+        """Best-effort acknowledgement so backend can hard-delete the registration."""
+        control_plane_token = self.secure.get_control_plane_token()
+        if not control_plane_token:
+            logging.warning("[CONNECTOR] Cannot acknowledge unpair because control-plane token is missing")
+            return False
+
+        payload = {"workstationId": self.workstation_id}
+        try:
+            response = requests.post(
+                f"{self.api_base}?action=ack-unpair",
+                headers={
+                    "X-API-Key": self.shared_api_key,
+                    "X-Control-Plane-Token": control_plane_token,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=5,
+            )
+            if response.status_code == 200:
+                logging.info("[CONNECTOR] Acknowledged unpair successfully")
+                return True
+
+            logging.warning("[CONNECTOR] Ack-unpair failed status=%s", response.status_code)
+            return False
+        except Exception as exc:
+            logging.warning("[CONNECTOR] Ack-unpair request failed: %s", exc)
+            return False
+
+    def handle_remote_disconnect(self, reason: str) -> None:
+        ack_success = self.acknowledge_unpair()
+        self.store.mark_server_unpaired(reason)
+        self.store.clear_local_runtime_state(include_pid_file=False)
+        _clear_connector_secrets()
+        REMOTE_UNPAIRED_EVENT.set()
+        logging.warning("[CONNECTOR] Remote disconnect detected reason=%s ack_success=%s", reason, ack_success)
+        show_info_message(
+            "Connection Removed",
+            "This device was disconnected from the warehouse.\n\nPlease pair again to continue.",
+        )
 
     def verify_registration(self) -> bool:
         """Verify that this device is still registered on the server.
 
         Returns True if registered, False if unpaired/removed.
         """
+        return self.check_registration_status() == "connected"
+
+    def check_registration_status(self) -> str:
+        """Return connected, unpaired, revoked, or transient."""
         control_plane_token = self.secure.get_control_plane_token()
         if not control_plane_token:
-            return False
+            return "revoked"
 
         try:
             response = requests.get(
@@ -942,18 +1071,17 @@ class ConnectorManager:
                 timeout=10
             )
 
-            # 200 = registered, 401 = not found/removed, other = error
-            if response.status_code == 200:
-                return True
-            elif response.status_code == 401:
+            status = self._classify_registration_response(response)
+            if status == "connected":
+                return "connected"
+            if status in {"unpaired", "revoked"}:
                 logging.warning("[CONNECTOR] Device no longer registered on server")
-                return False
-            else:
-                logging.warning(f"[CONNECTOR] Registration check failed: {response.status_code}")
-                return True  # Assume OK on network errors
+                return status
+            logging.warning(f"[CONNECTOR] Registration check failed: {response.status_code}")
+            return "transient"
         except Exception as e:
             logging.warning(f"[CONNECTOR] Registration check error: {e}")
-            return True  # Assume OK on network errors
+            return "transient"
 
     def _store_secrets(self, config: Dict[str, Any]) -> None:
         """Extract and store secrets from config to keychain."""
@@ -1781,6 +1909,9 @@ class PrintAgent:
         with ThreadPoolExecutor(max_workers=self.config.erp_agent_max_concurrent_requests,
                                thread_name_prefix="ErpAgentWorker") as executor:
             while not self.shutdown_requested:
+                if REMOTE_UNPAIRED_EVENT.is_set():
+                    self.shutdown_requested = True
+                    break
                 try:
                     requests = client.poll_requests(limit=self.config.erp_agent_max_concurrent_requests)
                     if not requests:
@@ -1841,6 +1972,9 @@ class PrintAgent:
         with ThreadPoolExecutor(max_workers=self.config.max_concurrent_jobs,
                                thread_name_prefix="PrinterWorker") as executor:
             while not self.shutdown_requested:
+                if REMOTE_UNPAIRED_EVENT.is_set():
+                    self.shutdown_requested = True
+                    break
                 try:
                     jobs = self._fetch_pending_jobs()
                     if not jobs:
@@ -2592,26 +2726,8 @@ def _load_legacy_env_config() -> Config:
     # Load or generate workstation_id for tracking
     workstation_id = os.getenv("WORKSTATION_ID")
     if not workstation_id:
-        import uuid
         workstation_id = str(uuid.uuid4())
-        # Persist to .env file for future runs (only if not already present)
-        try:
-            # Check if WORKSTATION_ID already exists in .env to prevent duplicates
-            env_file_exists = os.path.exists(".env")
-            has_workstation_id = False
-            if env_file_exists:
-                with open(".env", "r", encoding="utf-8") as f:
-                    if "WORKSTATION_ID=" in f.read():
-                        has_workstation_id = True
-                        logging.warning("WORKSTATION_ID found in .env but not loaded - check file permissions or format")
-
-            if not has_workstation_id:
-                with open(".env", "a", encoding="utf-8") as env_file:
-                    env_file.write(f"\n# Auto-generated workstation identifier (do not edit manually)\n")
-                    env_file.write(f"WORKSTATION_ID={workstation_id}\n")
-                logging.info("Generated and saved new WORKSTATION_ID=%s", workstation_id)
-        except Exception as exc:
-            logging.warning("Could not save WORKSTATION_ID to .env file: %s", exc)
+        logging.info("Generated runtime WORKSTATION_ID=%s (not persisted to .env)", workstation_id)
 
     erp_enabled = parse_bool_env("ERP_ENABLED", default=False)
     erp_default_timeout_seconds = float(os.getenv("ERP_DEFAULT_TIMEOUT_SECONDS", "10"))
@@ -2931,6 +3047,7 @@ def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str, succ
             logging.info("Console pairing completed successfully")
             if success_message:
                 print(success_message)
+            REMOTE_UNPAIRED_EVENT.clear()
             pause_for_debug()
             sys.exit(0)
         logging.error("Console pairing failed")
@@ -2950,6 +3067,7 @@ def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str, succ
         paired_successfully = wizard.run()
         if paired_successfully:
             logging.info("GUI setup wizard completed successfully")
+            REMOTE_UNPAIRED_EVENT.clear()
             if success_message:
                 show_info_message("Setup Complete", success_message)
             sys.exit(0)
@@ -3048,7 +3166,8 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Load .env before logging so log-file configuration is available early.
+    REMOTE_UNPAIRED_EVENT.clear()
+    ensure_env_file_exists()
     load_dotenv()
     startup_log_path = setup_startup_logging(force_file=getattr(sys, "frozen", False) and not args.console)
     logging.info(
@@ -3114,8 +3233,8 @@ def main() -> None:
     # NEW: Handle --setup command
     if args.setup:
         try:
-            config = load_config()
-            manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
+            bootstrap_config = _resolve_bootstrap_pairing_config()
+            manager = ConnectorManager(bootstrap_config.print_agent_url, bootstrap_config.print_agent_api_key)
             _launch_setup_wizard(
                 manager,
                 args,
@@ -3124,7 +3243,7 @@ def main() -> None:
             )
         except Exception as exc:
             logging.exception("Explicit setup failed before wizard launch: %s", exc)
-            print(f"\nSetup error: {exc}")
+            show_error_message("Setup Error", f"Could not start setup.\n\n{exc}")
             pause_for_debug()
             sys.exit(1)
         return
@@ -3173,9 +3292,6 @@ def main() -> None:
         print("Launching setup wizard to pair with your warehouse...")
         print()
 
-        # Ensure .env file exists (create from .env.example or minimal defaults)
-        ensure_env_file_exists()
-
         # Check if tkinter is available
         if not TKINTER_AVAILABLE:
             show_error_message(
@@ -3206,17 +3322,21 @@ def main() -> None:
         config = load_config()
         manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
 
-        if not manager.verify_registration():
+        registration_status = manager.check_registration_status()
+        if registration_status in {"unpaired", "revoked"}:
             print("Device is no longer registered on the server.")
             print("Resetting local state and launching setup wizard...")
             print()
 
-            _clear_local_pairing_state(store)
+            manager.handle_remote_disconnect(
+                "device_unpaired_by_admin" if registration_status == "unpaired" else "device_registration_revoked"
+            )
 
             # Launch setup wizard
-            ensure_env_file_exists()
+            bootstrap_config = _resolve_bootstrap_pairing_config()
+            reconnect_manager = ConnectorManager(bootstrap_config.print_agent_url, bootstrap_config.print_agent_api_key)
             _launch_setup_wizard(
-                manager,
+                reconnect_manager,
                 args,
                 reason="registration-reset",
                 success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.",

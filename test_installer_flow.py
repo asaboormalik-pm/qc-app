@@ -7,12 +7,13 @@ import os
 import shutil
 import time
 import unittest
+import builtins
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import print_agent
-from print_agent import Config, ConfigError, ErpEndpointConfig, LocalConfigStore, PrintAgent, SetupWizard
+from print_agent import Config, ConfigError, ErpEndpointConfig, LocalConfigStore, PrintAgent, SecureStorage, SetupWizard
 
 
 class SetupWizardBehaviorTests(unittest.TestCase):
@@ -123,6 +124,37 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertIn("PRINT_AGENT_CALLBACK_URL=https://example.com/functions/v1/print-agent", env_text)
         self.assertIn("PRINT_AGENT_API_KEY=shared-key", env_text)
 
+    def test_ensure_env_file_exists_heals_partial_packaged_env(self) -> None:
+        exe_dir = Path("test-output-heal-env")
+        if exe_dir.exists():
+            shutil.rmtree(exe_dir)
+        exe_dir.mkdir(parents=True)
+        (exe_dir / ".env").write_text(
+            "# Auto-generated workstation identifier (do not edit manually)\n"
+            "WORKSTATION_ID=test-only\n",
+            encoding="utf-8",
+        )
+        (exe_dir / ".env.example").write_text(
+            "PRINT_AGENT_CALLBACK_URL=https://example.com/functions/v1/print-agent\n"
+            "PRINT_AGENT_API_KEY=shared-key\n",
+            encoding="utf-8",
+        )
+
+        try:
+            with patch.object(print_agent, "get_exe_dir", return_value=exe_dir), \
+                 patch.object(print_agent.Path, "cwd", return_value=exe_dir), \
+                 patch.object(print_agent.sys, "frozen", True, create=True):
+                print_agent.ensure_env_file_exists()
+
+            env_text = (exe_dir / ".env").read_text(encoding="utf-8")
+        finally:
+            if exe_dir.exists():
+                shutil.rmtree(exe_dir)
+
+        self.assertIn("PRINT_AGENT_CALLBACK_URL=https://example.com/functions/v1/print-agent", env_text)
+        self.assertIn("PRINT_AGENT_API_KEY=shared-key", env_text)
+        self.assertNotIn("WORKSTATION_ID=test-only", env_text)
+
     def test_launch_setup_wizard_success_uses_info_message(self) -> None:
         args = SimpleNamespace(console=False)
         manager = Mock()
@@ -163,6 +195,17 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertEqual(exc.exception.code, 1)
         show_info.assert_not_called()
         show_error.assert_not_called()
+
+    def test_pause_for_debug_skips_input_when_no_tty(self) -> None:
+        stdin_mock = Mock()
+        stdin_mock.isatty.return_value = False
+
+        with patch.object(print_agent.sys, "frozen", True, create=True), \
+             patch.object(print_agent.sys, "stdin", stdin_mock), \
+             patch.object(builtins, "input") as input_mock:
+            print_agent.pause_for_debug()
+
+        input_mock.assert_not_called()
 
     def test_reset_pairing_refuses_when_bootstrap_validation_fails(self) -> None:
         args = SimpleNamespace(console=False)
@@ -216,6 +259,73 @@ class InstallerHelperTests(unittest.TestCase):
         store.reset_paired_state.assert_called_once()
         store.clear_local_runtime_state.assert_called_once()
         clear_secrets.assert_called_once()
+
+    def test_handle_remote_disconnect_marks_server_unpaired_and_sets_event(self) -> None:
+        app_dir = Path("test-output-remote-unpaired")
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        app_dir.mkdir(parents=True)
+        event_was_set = False
+
+        try:
+            with patch.object(LocalConfigStore, "get_app_data_dir", return_value=app_dir), \
+                 patch.object(print_agent, "_clear_connector_secrets") as clear_secrets, \
+                 patch.object(print_agent, "show_info_message") as show_info, \
+                 patch.object(print_agent.ConnectorManager, "acknowledge_unpair", return_value=True) as ack_unpair, \
+                 patch.object(SecureStorage, "get_control_plane_token", return_value="token"):
+                print_agent.REMOTE_UNPAIRED_EVENT.clear()
+                manager = print_agent.ConnectorManager("https://example.com/functions/v1/print-agent", "shared-key")
+                manager.store.save_state({
+                    "workstation_id": "ws-1",
+                    "is_paired": True,
+                    "connection_status": "paired_active",
+                    "paired_at": "2026-01-01T00:00:00+00:00",
+                    "warehouse_id": "wh-1",
+                    "station_name": "Station A",
+                })
+
+                manager.handle_remote_disconnect("device_unpaired_by_admin")
+
+                state = manager.store.load_state()
+                event_was_set = print_agent.REMOTE_UNPAIRED_EVENT.is_set()
+        finally:
+            print_agent.REMOTE_UNPAIRED_EVENT.clear()
+            if app_dir.exists():
+                shutil.rmtree(app_dir)
+
+        self.assertFalse(state["is_paired"])
+        self.assertEqual(state["connection_status"], "server_unpaired")
+        self.assertEqual(state["disconnect_reason"], "device_unpaired_by_admin")
+        self.assertTrue(event_was_set)
+        ack_unpair.assert_called_once()
+        clear_secrets.assert_called_once()
+        show_info.assert_called_once()
+
+    def test_acknowledge_unpair_posts_expected_request(self) -> None:
+        response = Mock()
+        response.status_code = 200
+        app_dir = Path("test-output-ack-unpair")
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        app_dir.mkdir(parents=True)
+
+        try:
+            with patch.object(LocalConfigStore, "get_app_data_dir", return_value=app_dir), \
+                 patch.object(SecureStorage, "get_control_plane_token", return_value="control-token"), \
+                 patch.object(print_agent.requests, "post", return_value=response) as post_request:
+                manager = print_agent.ConnectorManager("https://example.com/functions/v1/print-agent", "shared-key")
+                manager.workstation_id = "ws-ack-1"
+
+                result = manager.acknowledge_unpair()
+        finally:
+            if app_dir.exists():
+                shutil.rmtree(app_dir)
+
+        self.assertTrue(result)
+        _, kwargs = post_request.call_args
+        self.assertEqual(kwargs["json"], {"workstationId": "ws-ack-1"})
+        self.assertEqual(kwargs["headers"]["X-API-Key"], "shared-key")
+        self.assertEqual(kwargs["headers"]["X-Control-Plane-Token"], "control-token")
 
     def test_check_pid_file_removes_stale_pid_file(self) -> None:
         app_dir = Path("test-output-stale-pid")
