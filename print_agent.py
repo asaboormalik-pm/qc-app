@@ -50,9 +50,26 @@ try:
     test_root.withdraw()
     test_root.destroy()
     TKINTER_AVAILABLE = True
+    print("DEBUG: Tkinter is available and working")
 except Exception as e:
     print(f"WARNING: Tkinter not available: {e}")
+    import traceback
+    print("DEBUG: Tkinter error traceback:")
+    print(traceback.format_exc())
     TKINTER_AVAILABLE = False
+
+
+def pause_for_debug():
+    """Pause execution so user can read console messages (only in bundled exe)."""
+    if getattr(sys, 'frozen', False):
+        # Running as bundled executable
+        print()
+        print("=" * 60)
+        print("Press Enter to exit...")
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            pass
 
 
 def show_error_message(title: str, message: str) -> None:
@@ -876,7 +893,11 @@ class SetupWizard:
 
     def __init__(self, connector_manager: ConnectorManager):
         if not TKINTER_AVAILABLE:
-            raise RuntimeError("Tkinter is not available. Please install python3-tk.")
+            raise RuntimeError(
+                "Tkinter is not available.\n\n"
+                "This usually means the Tcl/Tk libraries were not bundled correctly.\n"
+                "Please use console mode: qc-print-agent.exe --console"
+            )
 
         print("DEBUG: Creating Tkinter root window...")
         try:
@@ -884,7 +905,13 @@ class SetupWizard:
             print("DEBUG: Tkinter root created successfully")
         except Exception as e:
             print(f"ERROR: Failed to create Tkinter root: {e}")
-            raise RuntimeError(f"Failed to create GUI window: {e}")
+            import traceback
+            print(traceback.format_exc())
+            raise RuntimeError(
+                f"Failed to create GUI window: {e}\n\n"
+                "The Tkinter library cannot initialize.\n"
+                "Please use console mode: qc-print-agent.exe --console"
+            )
 
         self.connector = connector_manager
         self.root.title("QC Connector Setup")
@@ -2724,6 +2751,11 @@ def main() -> None:
         help="Launch first-run setup wizard for pairing"
     )
     parser.add_argument(
+        "--console",
+        action="store_true",
+        help="Use console-based pairing instead of GUI"
+    )
+    parser.add_argument(
         "--test-print",
         metavar="PRINTER_IP",
         help="Test printer connection (e.g., --test-print 10.0.0.25)"
@@ -2787,14 +2819,50 @@ def main() -> None:
 
     # NEW: Handle --setup command
     if args.setup:
+        # Check if console mode is requested
+        if args.console:
+            print("\n=== CONSOLE MODE PAIRING ===\n")
+            try:
+                config = load_config()
+                manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
+                if console_pairing(manager):
+                    print("\nPairing successful! You can now run the agent normally.")
+                    pause_for_debug()
+                    sys.exit(0)
+                else:
+                    print("\nPairing failed.")
+                    pause_for_debug()
+                    sys.exit(1)
+            except Exception as exc:
+                print(f"\nSetup error: {exc}")
+                pause_for_debug()
+                sys.exit(1)
+            return
+
+        # GUI mode
         try:
             config = load_config()
             manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
             wizard = SetupWizard(manager)
             wizard.run()
         except Exception as exc:
-            print(f"Setup wizard error: {exc}")
-            sys.exit(1)
+            print(f"\nSetup wizard error: {exc}")
+            print("\nFalling back to console mode...")
+            try:
+                config = load_config()
+                manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
+                if console_pairing(manager):
+                    print("\nPairing successful via console!")
+                    pause_for_debug()
+                    sys.exit(0)
+                else:
+                    print("\nPairing failed.")
+                    pause_for_debug()
+                    sys.exit(1)
+            except Exception as console_exc:
+                print(f"\nConsole setup also failed: {console_exc}")
+                pause_for_debug()
+                sys.exit(1)
         return
 
     # NEW: Handle --test-print command

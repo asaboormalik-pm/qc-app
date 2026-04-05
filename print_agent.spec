@@ -30,8 +30,6 @@ elif is_macos:
 # Collect all hidden imports
 hiddenimports = [
     'keyring.backends',
-    'keyring.backends._OS_X_API',
-    'keyring.backends.SecretService',
     'keyring.backends.Windows',
     'keyring.backends.kwallet',
     'requests',
@@ -48,22 +46,59 @@ datas = [
 # Binary files to include
 binaries = []
 
-# CRITICAL: Collect Tcl/Tk binaries and data files for Windows
-# This ensures the GUI works in the bundled executable
+# CRITICAL: Collect Tcl/Tk binaries and data files for GUI
+# This ensures the setup wizard works in the bundled executable
 if is_windows:
-    import tkinter
-    tcl_dir = Path(sys.prefix) / 'tcl'
-    dlls_dir = Path(sys.prefix) / 'DLLs'
+    # Use PyInstaller's built-in data collection for tkinter
+    # This automatically finds and bundles Tcl/Tk DLLs and support files
+    try:
+        tkinter_datas = collect_data_files('tkinter', include_py_files=False)
+        datas.extend(tkinter_datas)
+    except Exception as e:
+        print(f"Warning: Could not collect tkinter data files: {e}")
 
-    # Collect Tcl/Tk DLLs (try both debug and release versions)
-    for dll in ['tcl86t.dll', 'tk86t.dll', 'tcl86.dll', 'tk86.dll']:
-        dll_path = dlls_dir / dll
-        if dll_path.exists():
-            binaries.append((str(dll_path), '.'))
+    # Also try to collect _tkinter module data
+    try:
+        tk_datas = collect_data_files('_tkinter', include_py_files=False)
+        datas.extend(tk_datas)
+    except Exception as e:
+        print(f"Warning: Could not collect _tkinter data files: {e}")
 
-    # Collect entire tcl directory (contains required scripts and libraries)
-    if tcl_dir.exists():
-        datas.append((str(tcl_dir), 'tcl'))
+    # Explicitly collect Tcl/Tk DLLs from common locations
+    # This handles different Python distributions
+    tcl_dll_names = ['tcl86t.dll', 'tk86t.dll', 'tcl86.dll', 'tk86.dll',
+                     'tcl87t.dll', 'tk87t.dll', 'tcl87.dll', 'tk87.dll',
+                     'tcl88t.dll', 'tk88t.dll', 'tcl88.dll', 'tk88.dll',
+                     'tcl89t.dll', 'tk89t.dll', 'tcl89.dll', 'tk89.dll']
+
+    # Search in standard locations
+    search_paths = [
+        Path(sys.prefix) / 'DLLs',
+        Path(sys.base_prefix) / 'DLLs',
+        Path(sys.executable).parent / 'DLLs',
+    ]
+
+    for dll_name in tcl_dll_names:
+        for search_path in search_paths:
+            dll_path = search_path / dll_name
+            if dll_path.exists():
+                binaries.append((str(dll_path), '.'))
+                break
+
+    # Try to collect the tcl directory with supporting files
+    tcl_search_paths = [
+        Path(sys.prefix) / 'tcl',
+        Path(sys.base_prefix) / 'tcl',
+        Path(sys.executable).parent / 'tcl',
+    ]
+
+    for tcl_path in tcl_search_paths:
+        if tcl_path.exists() and tcl_path.is_dir():
+            try:
+                datas.append((str(tcl_path), 'tcl'))
+                break
+            except Exception:
+                pass
 
 a = Analysis(
     ['print_agent.py'],
@@ -104,7 +139,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,  # Show console to debug GUI issues
+    console=True,  # Keep console for debugging - can change to False later
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
