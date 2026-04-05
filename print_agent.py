@@ -893,6 +893,13 @@ class SetupWizard:
 
         print("DEBUG: Creating widgets...")
         self.create_widgets()
+
+        # Ensure window is visible and on top
+        self.root.lift()
+        self.root.attributes('-topmost', True)
+        self.root.after_idle(self.root.attributes, '-topmost', False)
+        self.root.focus_force()
+
         print("DEBUG: Setup wizard initialized")
 
     def create_widgets(self):
@@ -972,6 +979,60 @@ class SetupWizard:
     def run(self):
         """Start the Tkinter main loop."""
         self.root.mainloop()
+
+
+def console_pairing(connector_manager: ConnectorManager) -> bool:
+    """Fallback console-based pairing when GUI fails.
+
+    This provides an alternative way to pair the connector when Tkinter
+    is not available or the GUI fails to display.
+    """
+    print("\n" + "=" * 50)
+    print("  CONSOLE-BASED CONNECTOR PAIRING")
+    print("=" * 50)
+    print()
+    print("Enter the 6-digit pairing code from the warehouse connector page:")
+    print()
+
+    try:
+        code = input("Pairing Code: ").strip().upper()
+    except (EOFError, KeyboardInterrupt):
+        print("\nPairing cancelled.")
+        return False
+
+    if not code or len(code) != 6:
+        print("\nERROR: Invalid pairing code. Please enter exactly 6 digits.")
+        return False
+
+    print()
+    try:
+        station_name = input("Station Name (optional, press Enter to skip): ").strip() or None
+    except (EOFError, KeyboardInterrupt):
+        station_name = None
+
+    print()
+    print("Connecting to warehouse...")
+    result = connector_manager.pair_with_code(code, station_name)
+
+    if result.get("success"):
+        station = result.get('stationName', 'Unknown')
+        print(f"\n{'=' * 50}")
+        print(f"  SUCCESS!")
+        print(f"{'=' * 50}")
+        print(f"Paired to: {station}")
+        print(f"Workstation ID: {result.get('workstationId', 'N/A')}")
+        print()
+        print("You can now close this window and restart the connector.")
+        print(f"{'=' * 50}\n")
+        return True
+    else:
+        error = result.get('error', 'Unknown error')
+        print(f"\n{'=' * 50}")
+        print(f"  PAIRING FAILED")
+        print(f"{'=' * 50}")
+        print(f"Error: {error}")
+        print(f"{'=' * 50}\n")
+        return False
 
 
 class PrintAgent:
@@ -2804,11 +2865,21 @@ def main() -> None:
         except Exception as exc:
             import traceback
             error_details = f"{exc}\n\n{traceback.format_exc()}"
-            show_error_message(
-                "Setup Wizard Error",
-                f"Failed to launch setup wizard:\n\n{error_details}\n\nPlease try again or contact support."
-            )
-            sys.exit(1)
+            print(f"\nGUI setup wizard failed: {error_details}")
+            print("\nFalling back to console-based pairing...\n")
+
+            # Fallback to console-based pairing
+            try:
+                config = load_config()
+                manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
+                if console_pairing(manager):
+                    sys.exit(0)
+                else:
+                    print("\nPairing failed. Please try again or contact support.")
+                    sys.exit(1)
+            except Exception as console_exc:
+                print(f"\nConsole pairing also failed: {console_exc}")
+                sys.exit(1)
 
     # Device is paired locally - verify it's still registered on server
     # (handles case where device was unpaired from frontend)
@@ -2832,14 +2903,23 @@ def main() -> None:
             ensure_env_file_exists()
 
             if not TKINTER_AVAILABLE:
-                show_error_message(
-                    "Setup Wizard Error",
-                    "Tkinter GUI is not available.\n\nPlease reinstall the application."
-                )
-                sys.exit(1)
+                # Use console pairing directly
+                print("Tkinter GUI not available. Using console-based pairing...\n")
+                if console_pairing(manager):
+                    sys.exit(0)
+                else:
+                    sys.exit(1)
 
-            wizard = SetupWizard(manager)
-            wizard.run()
+            try:
+                wizard = SetupWizard(manager)
+                wizard.run()
+            except Exception as gui_exc:
+                print(f"\nGUI setup wizard failed: {gui_exc}")
+                print("\nFalling back to console-based pairing...\n")
+                if console_pairing(manager):
+                    sys.exit(0)
+                else:
+                    sys.exit(1)
 
             show_error_message(
                 "Setup Complete",

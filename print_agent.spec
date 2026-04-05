@@ -48,15 +48,22 @@ datas = [
 # Binary files to include
 binaries = []
 
-# CRITICAL: Collect Tcl/Tk data files for Windows
+# CRITICAL: Collect Tcl/Tk binaries and data files for Windows
 # This ensures the GUI works in the bundled executable
 if is_windows:
-    try:
-        tkinter_datas = collect_data_files('tkinter')
-        datas.extend(tkinter_datas)
-    except Exception:
-        # If collect_data_files fails, try manual collection
-        pass
+    import tkinter
+    tcl_dir = Path(sys.prefix) / 'tcl'
+    dlls_dir = Path(sys.prefix) / 'DLLs'
+
+    # Collect Tcl/Tk DLLs (try both debug and release versions)
+    for dll in ['tcl86t.dll', 'tk86t.dll', 'tcl86.dll', 'tk86.dll']:
+        dll_path = dlls_dir / dll
+        if dll_path.exists():
+            binaries.append((str(dll_path), '.'))
+
+    # Collect entire tcl directory (contains required scripts and libraries)
+    if tcl_dir.exists():
+        datas.append((str(tcl_dir), 'tcl'))
 
 a = Analysis(
     ['print_agent.py'],

@@ -29,6 +29,13 @@ jobs:
         run: |
           python -m PyInstaller print_agent.spec --clean
 
+      - name: Verify bundled Tcl/Tk files
+        run: |
+          echo "Checking for Tcl/Tk DLLs in build..."
+          dir dist\*.exe
+          echo "Checking PyInstaller build output..."
+          dir build\print_agent *.toc
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
