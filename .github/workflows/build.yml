@@ -96,22 +96,34 @@ jobs:
             Copy-Item .env.example dist\qc-print-agent\.env.example -Force
           }
 
+      - name: Set archive name
+        id: windows_archive
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $version = $env:GITHUB_REF_NAME
+          } else {
+            $version = "$($env:GITHUB_REF_NAME)-build-$($env:GITHUB_RUN_NUMBER)"
+          }
+          "archive_name=qc-print-agent-windows-$version.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Create ZIP archive
         run: |
           cd dist
-          Compress-Archive -Path qc-print-agent -DestinationPath qc-print-agent-windows.zip
+          Compress-Archive -Path qc-print-agent -DestinationPath "${{ steps.windows_archive.outputs.archive_name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qc-print-agent-windows
-          path: dist/qc-print-agent-windows.zip
+          name: ${{ steps.windows_archive.outputs.archive_name }}
+          path: dist/${{ steps.windows_archive.outputs.archive_name }}
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/qc-print-agent-windows.zip
+          files: dist/${{ steps.windows_archive.outputs.archive_name }}
+          generate_release_notes: true
 
   build-macos:
     runs-on: macos-latest
@@ -195,19 +207,30 @@ jobs:
             cp .env.example "dist/QC Print Agent.app/Contents/MacOS/.env.example"
           fi
 
+      - name: Set archive name
+        id: macos_archive
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION="${GITHUB_REF_NAME}-build-${GITHUB_RUN_NUMBER}"
+          fi
+          echo "archive_name=qc-print-agent-macos-${VERSION}.tar.gz" >> "$GITHUB_OUTPUT"
+
       - name: Create ZIP archive
         run: |
           cd dist
-          tar -czf qc-print-agent-macos.tar.gz "QC Print Agent.app"
+          tar -czf "${{ steps.macos_archive.outputs.archive_name }}" "QC Print Agent.app"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qc-print-agent-macos
-          path: dist/qc-print-agent-macos.tar.gz
+          name: ${{ steps.macos_archive.outputs.archive_name }}
+          path: dist/${{ steps.macos_archive.outputs.archive_name }}
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/qc-print-agent-macos.tar.gz
+          files: dist/${{ steps.macos_archive.outputs.archive_name }}
+          generate_release_notes: true
