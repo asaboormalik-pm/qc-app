@@ -30,7 +30,9 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          python -m PyInstaller print_agent.spec --clean
+          # Remove dist folder to avoid "not empty" error
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          python -m PyInstaller print_agent.spec
 
       - name: Verify bundled Tcl/Tk files
         run: |
@@ -79,7 +81,9 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          python3 -m PyInstaller print_agent.spec --clean
+          # Remove dist folder to avoid "not empty" error
+          rm -rf dist
+          python3 -m PyInstaller print_agent.spec
 
       - name: Create ZIP for app bundle
         run: |
