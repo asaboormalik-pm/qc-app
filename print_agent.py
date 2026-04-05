@@ -838,7 +838,8 @@ class PrintAgent:
         """Process completion event request to 1C.
 
         IMPORTANT: request_payload is passed through exactly as received from Supabase.
-        No timestamp normalization or field modifications for completion events.
+        No field-level validation, timestamp normalization, or payload modifications
+        are performed for completion events.
 
         Args:
             request: Generic ERP request with business_type='completion_event'
@@ -850,10 +851,6 @@ class PrintAgent:
         logging.info("[ERP-AGENT] Processing business_type=completion_event request_id=%s message_id=%s",
                    request.request_id, request.request_payload.get("message_id") if request.request_payload else "N/A")
 
-        # Validate required fields exist in request_payload
-        required_fields = ["message_id", "invoice_id", "client_id", "timestamp",
-                          "operator_id", "warehouse_id", "boxes", "shortages", "summary"]
-
         if not request.request_payload:
             error_msg = "ERP request failed: request_payload is missing or empty"
             logging.error("[ERP-AGENT] %s request_id=%s", error_msg, request.request_id)
@@ -864,16 +861,17 @@ class PrintAgent:
                             request.request_id, callback_exc)
             return False
 
-        for field in required_fields:
-            if field not in request.request_payload:
-                error_msg = f"ERP request failed: required field '{field}' is missing from request_payload"
-                logging.error("[ERP-AGENT] %s request_id=%s", error_msg, request.request_id)
-                try:
-                    client.post_completion_failure(request.request_id, error_msg)
-                except Exception as callback_exc:
-                    logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
-                                request.request_id, callback_exc)
-                return False
+        if not isinstance(request.request_payload, dict):
+            error_msg = (
+                f"ERP request failed: request_payload must be a JSON object, got {type(request.request_payload)}"
+            )
+            logging.error("[ERP-AGENT] %s request_id=%s", error_msg, request.request_id)
+            try:
+                client.post_completion_failure(request.request_id, error_msg)
+            except Exception as callback_exc:
+                logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
+                            request.request_id, callback_exc)
+            return False
 
         # Generate correlation ID and idempotency key
         correlation_id = str(uuid.uuid4())

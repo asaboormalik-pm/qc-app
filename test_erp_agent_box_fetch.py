@@ -147,6 +147,45 @@ class ErpAgentBoxFetchTests(unittest.TestCase):
         self.client.post_completion_success.assert_called_once_with("req-3", {"status": "success"})
         self.client.post_completion_failure.assert_not_called()
 
+    def test_completion_event_forwards_payload_without_required_field_validation(self) -> None:
+        payload = {
+            "message_id": "msg-2",
+            "invoice_id": "inv-2",
+            "timestamp": "2026-03-31T15:38:12.357Z",
+            "operator_id": "op-2",
+            "warehouse_id": "WH-ORIGINAL",
+            "boxes": [],
+            "shortages": [],
+            "summary": {},
+        }
+        request = GenericErpRequest(
+            request_id="req-4",
+            business_type="completion_event",
+            endpoint_key="completion_event",
+            request_payload=payload,
+            attempts=0,
+            max_attempts=3,
+        )
+
+        with patch.object(
+            self.agent,
+            "_send_erp_http_request",
+            return_value={
+                "status_code": 200,
+                "correlation_id": "corr-4",
+                "idempotency_key": "req-4",
+                "body": '{"status":"success"}',
+            },
+        ) as send_request:
+            result = self.agent._process_completion_event(request, self.client)
+
+        self.assertTrue(result)
+        send_request.assert_called_once()
+        _, kwargs = send_request.call_args
+        self.assertIs(kwargs["payload"], payload)
+        self.client.post_completion_success.assert_called_once_with("req-4", {"status": "success"})
+        self.client.post_completion_failure.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
