@@ -195,7 +195,7 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertIn("PRINT_AGENT_API_KEY=shared-key", env_text)
         self.assertNotIn("WORKSTATION_ID=test-only", env_text)
 
-    def test_launch_setup_wizard_success_uses_info_message(self) -> None:
+    def test_launch_setup_wizard_success_returns_true_without_popup(self) -> None:
         args = SimpleNamespace(console=False)
         manager = Mock()
         wizard = Mock()
@@ -204,18 +204,14 @@ class InstallerHelperTests(unittest.TestCase):
         with patch.object(print_agent, "SetupWizard", return_value=wizard), \
              patch.object(print_agent, "TKINTER_AVAILABLE", True), \
              patch.object(print_agent, "show_info_message") as show_info, \
-             patch.object(print_agent, "show_error_message") as show_error, \
-             patch.object(print_agent, "sys") as mock_sys:
-            mock_sys.exit.side_effect = SystemExit(0)
+             patch.object(print_agent, "show_error_message") as show_error:
+            result = print_agent._launch_setup_wizard(manager, args, "test-success")
 
-            with self.assertRaises(SystemExit) as exc:
-                print_agent._launch_setup_wizard(manager, args, "test-success", "paired!")
-
-        self.assertEqual(exc.exception.code, 0)
-        show_info.assert_called_once_with("Setup Complete", "paired!")
+        self.assertTrue(result)
+        show_info.assert_not_called()
         show_error.assert_not_called()
 
-    def test_launch_setup_wizard_cancel_exits_non_success_without_popup(self) -> None:
+    def test_launch_setup_wizard_cancel_returns_false_without_popup(self) -> None:
         args = SimpleNamespace(console=False)
         manager = Mock()
         wizard = Mock()
@@ -225,14 +221,10 @@ class InstallerHelperTests(unittest.TestCase):
         with patch.object(print_agent, "SetupWizard", return_value=wizard), \
              patch.object(print_agent, "TKINTER_AVAILABLE", True), \
              patch.object(print_agent, "show_info_message") as show_info, \
-             patch.object(print_agent, "show_error_message") as show_error, \
-             patch.object(print_agent, "sys") as mock_sys:
-            mock_sys.exit.side_effect = SystemExit(1)
+             patch.object(print_agent, "show_error_message") as show_error:
+            result = print_agent._launch_setup_wizard(manager, args, "test-cancel")
 
-            with self.assertRaises(SystemExit) as exc:
-                print_agent._launch_setup_wizard(manager, args, "test-cancel", "paired!")
-
-        self.assertEqual(exc.exception.code, 1)
+        self.assertFalse(result)
         show_info.assert_not_called()
         show_error.assert_not_called()
 

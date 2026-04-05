@@ -1189,8 +1189,6 @@ class SetupWizard:
         self.status_label.pack(pady=20)
 
     def on_connect(self):
-        from tkinter import messagebox
-
         code = self.code_entry.get().strip().upper()
         station_name = self.name_entry.get().strip() or None
 
@@ -1204,15 +1202,11 @@ class SetupWizard:
         result = self.connector.pair_with_code(code, station_name)
 
         if result.get("success"):
-            station_name = result.get("stationName", "Unknown")
             self.paired_successfully = True
             self.close_reason = "success"
-            messagebox.showinfo(
-                "Success",
-                f"Successfully paired to {station_name}!\n\n"
-                f"You can now close this window. The connector will start automatically."
-            )
-            self.on_cancel()
+            self.status_label.config(text="Paired successfully. Starting connector...")
+            self.root.update_idletasks()
+            self.root.destroy()
         else:
             error = result.get("error", "Unknown error")
             messagebox.showerror("Error", f"Failed to pair: {error}")
@@ -1774,7 +1768,8 @@ class PrintAgent:
         """Process completion event request to 1C.
 
         IMPORTANT: request_payload is passed through exactly as received from Supabase.
-        No timestamp normalization or field modifications for completion events.
+        No field-level validation, timestamp normalization, or payload modifications
+        are performed for completion events.
 
         Args:
             request: Generic ERP request with business_type='completion_event'
@@ -1786,10 +1781,6 @@ class PrintAgent:
         logging.info("[ERP-AGENT] Processing business_type=completion_event request_id=%s message_id=%s",
                    request.request_id, request.request_payload.get("message_id") if request.request_payload else "N/A")
 
-        # Validate required fields exist in request_payload
-        required_fields = ["message_id", "invoice_id", "client_id", "timestamp",
-                          "operator_id", "warehouse_id", "boxes", "shortages", "summary"]
-
         if not request.request_payload:
             error_msg = "ERP request failed: request_payload is missing or empty"
             logging.error("[ERP-AGENT] %s request_id=%s", error_msg, request.request_id)
@@ -1800,16 +1791,17 @@ class PrintAgent:
                             request.request_id, callback_exc)
             return False
 
-        for field in required_fields:
-            if field not in request.request_payload:
-                error_msg = f"ERP request failed: required field '{field}' is missing from request_payload"
-                logging.error("[ERP-AGENT] %s request_id=%s", error_msg, request.request_id)
-                try:
-                    client.post_completion_failure(request.request_id, error_msg)
-                except Exception as callback_exc:
-                    logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
-                                request.request_id, callback_exc)
-                return False
+        if not isinstance(request.request_payload, dict):
+            error_msg = (
+                f"ERP request failed: request_payload must be a JSON object, got {type(request.request_payload)}"
+            )
+            logging.error("[ERP-AGENT] %s request_id=%s", error_msg, request.request_id)
+            try:
+                client.post_completion_failure(request.request_id, error_msg)
+            except Exception as callback_exc:
+                logging.error("[ERP-AGENT] Failed to send failure callback for request_id=%s: %s",
+                            request.request_id, callback_exc)
+            return False
 
         # Generate correlation ID and idempotency key
         correlation_id = str(uuid.uuid4())
@@ -3039,21 +3031,18 @@ def _clear_local_pairing_state(store: LocalConfigStore) -> None:
     logging.info("Cleared local pairing state and runtime files")
 
 
-def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str, success_message: Optional[str] = None) -> None:
+def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str) -> bool:
     logging.info("Setup wizard path selected reason=%s console=%s tkinter=%s", reason, args.console, TKINTER_AVAILABLE)
 
     if args.console:
         print("\n=== CONSOLE MODE PAIRING ===\n")
         if console_pairing(manager):
             logging.info("Console pairing completed successfully")
-            if success_message:
-                print(success_message)
             REMOTE_UNPAIRED_EVENT.clear()
-            pause_for_debug()
-            sys.exit(0)
+            return True
         logging.error("Console pairing failed")
         pause_for_debug()
-        sys.exit(1)
+        return False
 
     if not TKINTER_AVAILABLE:
         logging.error("Setup requested but Tkinter is unavailable")
@@ -3061,7 +3050,7 @@ def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str, succ
             "Setup Wizard Error",
             "Tkinter GUI is not available.\n\nThe setup wizard requires Tkinter.\n\nPlease use --console or contact support.",
         )
-        sys.exit(1)
+        return False
 
     try:
         wizard = SetupWizard(manager)
@@ -3069,24 +3058,23 @@ def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str, succ
         if paired_successfully:
             logging.info("GUI setup wizard completed successfully")
             REMOTE_UNPAIRED_EVENT.clear()
-            if success_message:
-                show_info_message("Setup Complete", success_message)
-            sys.exit(0)
+            return True
 
         logging.warning("GUI setup wizard exited without pairing close_reason=%s", wizard.close_reason)
-        sys.exit(1)
+        return False
     except Exception as exc:
         logging.exception("GUI setup wizard failed, falling back to console: %s", exc)
         print(f"\nGUI setup wizard failed: {exc}")
         print("\nFalling back to console-based pairing...\n")
         if console_pairing(manager):
             logging.info("Console pairing fallback completed successfully")
-            sys.exit(0)
+            REMOTE_UNPAIRED_EVENT.clear()
+            return True
         logging.error("Console pairing fallback failed")
-        sys.exit(1)
+        return False
 
 
-def _reset_pairing_state(args: Any) -> None:
+def _reset_pairing_state(args: Any) -> bool:
     store = LocalConfigStore()
     setup_startup_logging(force_file=getattr(sys, "frozen", False))
     logging.info("Reset pairing requested")
@@ -3106,11 +3094,10 @@ def _reset_pairing_state(args: Any) -> None:
 
     _clear_local_pairing_state(store)
     manager = ConnectorManager(bootstrap_config.print_agent_url, bootstrap_config.print_agent_api_key)
-    _launch_setup_wizard(
+    return _launch_setup_wizard(
         manager,
         args,
         reason="explicit-reset-pairing",
-        success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.\n\nFor background mode, use: qc-print-agent.exe --daemon",
     )
 
 
@@ -3228,26 +3215,25 @@ def main() -> None:
         return
 
     if args.reset_pairing:
-        _reset_pairing_state(args)
-        return
+        if not _reset_pairing_state(args):
+            sys.exit(1)
 
     # NEW: Handle --setup command
     if args.setup:
         try:
             bootstrap_config = _resolve_bootstrap_pairing_config()
             manager = ConnectorManager(bootstrap_config.print_agent_url, bootstrap_config.print_agent_api_key)
-            _launch_setup_wizard(
+            if not _launch_setup_wizard(
                 manager,
                 args,
                 reason="explicit-setup",
-                success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.\n\nFor background mode, use: qc-print-agent.exe --daemon",
-            )
+            ):
+                sys.exit(1)
         except Exception as exc:
             logging.exception("Explicit setup failed before wizard launch: %s", exc)
             show_error_message("Setup Error", f"Could not start setup.\n\n{exc}")
             pause_for_debug()
             sys.exit(1)
-        return
 
     # NEW: Handle --test-print command
     if args.test_print:
@@ -3304,12 +3290,12 @@ def main() -> None:
         try:
             config = load_config()
             manager = ConnectorManager(config.print_agent_url, config.print_agent_api_key)
-            _launch_setup_wizard(
+            if not _launch_setup_wizard(
                 manager,
                 args,
                 reason="auto-first-run",
-                success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.\n\nFor background mode, use: qc-print-agent.exe --daemon",
-            )
+            ):
+                sys.exit(1)
         except Exception as exc:
             logging.exception("Auto first-run setup failed before wizard launch: %s", exc)
             print(f"\nSetup failed: {exc}")
@@ -3336,12 +3322,12 @@ def main() -> None:
             # Launch setup wizard
             bootstrap_config = _resolve_bootstrap_pairing_config()
             reconnect_manager = ConnectorManager(bootstrap_config.print_agent_url, bootstrap_config.print_agent_api_key)
-            _launch_setup_wizard(
+            if not _launch_setup_wizard(
                 reconnect_manager,
                 args,
                 reason="registration-reset",
-                success_message="Connector paired successfully!\n\nPlease run qc-print-agent.exe again to start processing jobs.",
-            )
+            ):
+                sys.exit(1)
     except Exception as exc:
         # On network errors, continue anyway (might be temporary)
         logging.warning("Registration verification failed, continuing with local state: %s", exc)
