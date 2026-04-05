@@ -126,17 +126,18 @@ coll = COLLECT(
 )
 
 # macOS: Create .app bundle from the collected folder
+# Note: We use 'coll' not 'exe' because onedir mode has exclude_binaries=True
 if is_macos:
     app = BUNDLE(
-        exe,
+        coll,
         name='QC Print Agent.app',
         icon=icon_file,
         bundle_identifier='com.qc.print-agent',
         info_plist={
             'CFBundleName': 'QC Print Agent',
             'CFBundleDisplayName': 'QC Print Agent',
-            'CFBundleVersion': '1.0.0',
-            'CFBundleShortVersionString': '1.0.0',
-            'LSUIElement': True,
+            'CFBundleVersion': '1.1.0',
+            'CFBundleShortVersionString': '1.1.0',
+            'LSUIElement': True,  # Run as background agent (no dock icon)
         },
     )
