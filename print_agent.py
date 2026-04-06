@@ -920,16 +920,6 @@ class ConnectorManager:
             if response.status_code == 200:
                 data = response.json()
                 if data.get("success"):
-                    # Store secrets in keychain
-                    config = data["config"]
-                    self._store_secrets(config)
-
-                    # Store non-secret config in app data
-                    self.store.save_config(config)
-
-                    # Save config to .env file for next run
-                    self.store.save_config_to_env(config)
-
                     # Store control-plane token
                     control_plane_token = data.get("controlPlaneToken")
                     if control_plane_token:
@@ -941,6 +931,11 @@ class ConnectorManager:
                         self.workstation_id = workstation_id
                         self.state["workstation_id"] = workstation_id
                         self.store.save_workstation_id(workstation_id)
+
+                    config = self._prepare_runtime_config_after_pair(data)
+                    self._store_secrets(config)
+                    self.store.save_config(config)
+                    self.store.save_config_to_env(config)
 
                     # Update pairing state
                     self.state["is_paired"] = True
@@ -971,6 +966,59 @@ class ConnectorManager:
         except Exception as e:
             logging.error(f"[CONNECTOR] Pairing error: {e}")
             return {"success": False, "error": str(e)}
+
+    def _build_fallback_runtime_config(self) -> Dict[str, Any]:
+        env_values = _read_env_file_values(Path(".env"))
+        erp_agent_url = env_values.get("ERP_AGENT_URL", "").strip()
+        if not erp_agent_url and self.api_base:
+            erp_agent_url = self.api_base.replace("print-agent", "erp-agent")
+
+        erp_endpoints_raw = env_values.get("ERP_ENDPOINTS_JSON", "{}").strip() or "{}"
+        try:
+            erp_endpoints = json.loads(erp_endpoints_raw)
+        except json.JSONDecodeError:
+            erp_endpoints = {}
+
+        return {
+            "print_agent_url": self.api_base,
+            "edgeFunctions": {
+                "sharedUrl": self.api_base,
+                "apiKey": self.shared_api_key,
+                "erpAgentUrl": erp_agent_url,
+            },
+            "erp_enabled": True,
+            "erp_agent_enabled": True,
+            "erp_agent_url": erp_agent_url,
+            "erp_endpoints_json": json.dumps(erp_endpoints),
+            "erp": {
+                "enabled": True,
+                "agent": {
+                    "enabled": True,
+                    "url": erp_agent_url,
+                },
+                "endpoints": erp_endpoints,
+                "auth": {
+                    "mode": env_values.get("ERP_AUTH_MODE", "none").strip() or "none",
+                },
+            },
+            "poll_interval_seconds": float(env_values.get("POLL_INTERVAL_SECONDS", "2") or "2"),
+            "max_concurrent_jobs": int(env_values.get("MAX_CONCURRENT_JOBS", "3") or "3"),
+            "printer_port": int(env_values.get("PRINTER_PORT", "9100") or "9100"),
+            "printer_timeout_seconds": float(env_values.get("PRINTER_TIMEOUT_SECONDS", "5") or "5"),
+        }
+
+    def _prepare_runtime_config_after_pair(self, pair_response: Dict[str, Any]) -> Dict[str, Any]:
+        raw_config = pair_response.get("config")
+        if isinstance(raw_config, dict) and raw_config:
+            return raw_config
+
+        fetched_config = self.fetch_config()
+        if isinstance(fetched_config, dict) and fetched_config and "status" not in fetched_config:
+            logging.info("[CONNECTOR] Hydrated runtime config from config endpoint after pairing")
+            return fetched_config
+
+        logging.warning("[CONNECTOR] Pair response did not include usable config; synthesizing fallback runtime config")
+        return self._build_fallback_runtime_config()
 
     def fetch_config(self) -> Optional[Dict[str, Any]]:
         """Fetch latest config from backend."""

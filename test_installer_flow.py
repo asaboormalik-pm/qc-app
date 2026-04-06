@@ -153,6 +153,54 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertTrue(saved_state["is_paired"])
         self.assertEqual(saved_state["connection_status"], "paired_active")
 
+    def test_pair_with_code_hydrates_runtime_config_when_pair_response_config_is_empty(self) -> None:
+        app_dir = Path("test-output-pair-config-hydrate")
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        app_dir.mkdir(parents=True)
+
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "success": True,
+            "config": {},
+            "controlPlaneToken": "control-token",
+            "workstationId": "backend-ws-456",
+            "warehouseId": "warehouse-2",
+            "stationName": "Station B",
+        }
+
+        hydrated_config = {
+            "print_agent_url": "https://example.com/functions/v1/print-agent",
+            "edgeFunctions": {
+                "sharedUrl": "https://example.com/functions/v1/print-agent",
+                "erpAgentUrl": "https://example.com/functions/v1/erp-agent",
+                "apiKey": "shared-key",
+            },
+            "erp": {
+                "endpoints": {
+                    "erp_box_fetch": {"url": "https://erp.example.com/boxes", "method": "GET"},
+                }
+            },
+        }
+
+        try:
+            with patch.object(LocalConfigStore, "get_app_data_dir", return_value=app_dir), \
+                 patch.object(print_agent.requests, "post", return_value=response), \
+                 patch.object(print_agent.SecureStorage, "set_control_plane_token"), \
+                 patch.object(print_agent.ConnectorManager, "_store_secrets"), \
+                 patch.object(print_agent.ConnectorManager, "fetch_config", return_value=hydrated_config):
+                manager = print_agent.ConnectorManager("https://example.com/functions/v1/print-agent", "shared-key")
+                result = manager.pair_with_code("XYZ789")
+                saved_config = manager.store.load_config()
+        finally:
+            if app_dir.exists():
+                shutil.rmtree(app_dir)
+
+        self.assertTrue(result["success"])
+        self.assertIsNotNone(saved_config)
+        self.assertEqual(saved_config["edgeFunctions"]["erpAgentUrl"], "https://example.com/functions/v1/erp-agent")
+
     def test_sanitize_env_value_for_log_redacts_sensitive_values(self) -> None:
         self.assertEqual(print_agent._sanitize_env_value_for_log("PRINT_AGENT_API_KEY", "secret-value"), "[redacted]")
         self.assertEqual(print_agent._sanitize_env_value_for_log("ERP_AUTH_BASIC_PASSWORD", "secret-pass"), "[redacted]")
