@@ -525,6 +525,14 @@ class SecureStorage:
         import keyring
         return keyring.get_password(self.service_name, "control_plane_token")
 
+    def clear_control_plane_token(self) -> None:
+        """Remove the stored control-plane token only."""
+        import keyring
+        try:
+            keyring.delete_password(self.service_name, "control_plane_token")
+        except Exception:
+            pass
+
     def set_erp_basic_auth(self, username: str, password: str) -> None:
         """Store ERP basic auth credentials."""
         import keyring
@@ -921,9 +929,12 @@ class ConnectorManager:
                 data = response.json()
                 if data.get("success"):
                     # Store control-plane token
-                    control_plane_token = data.get("controlPlaneToken")
-                    if control_plane_token:
-                        self.secure.set_control_plane_token(control_plane_token)
+                    control_plane_token = self._extract_control_plane_token(data)
+                    self.secure.clear_control_plane_token()
+                    if not control_plane_token:
+                        logging.error("[CONNECTOR] Pair response missing control-plane token")
+                        return {"success": False, "error": "Pair response did not include a control-plane token"}
+                    self.secure.set_control_plane_token(control_plane_token)
 
                     # Update workstation_id from response (assigned by backend)
                     workstation_id = data.get("workstationId")
@@ -966,6 +977,17 @@ class ConnectorManager:
         except Exception as e:
             logging.error(f"[CONNECTOR] Pairing error: {e}")
             return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _extract_control_plane_token(pair_response: Dict[str, Any]) -> Optional[str]:
+        token = pair_response.get("controlPlaneToken") or pair_response.get("control_plane_token")
+        if not token:
+            control_plane = pair_response.get("controlPlane")
+            if isinstance(control_plane, dict):
+                token = control_plane.get("token")
+        if isinstance(token, str):
+            token = token.strip()
+        return token or None
 
     def _build_fallback_runtime_config(self) -> Dict[str, Any]:
         env_values = _read_env_file_values(Path(".env"))

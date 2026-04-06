@@ -153,6 +153,81 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertTrue(saved_state["is_paired"])
         self.assertEqual(saved_state["connection_status"], "paired_active")
 
+    def test_pair_with_code_accepts_snake_case_control_plane_token(self) -> None:
+        app_dir = Path("test-output-pair-token-snake-case")
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        app_dir.mkdir(parents=True)
+
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "success": True,
+            "config": {
+                "edgeFunctions": {
+                    "sharedUrl": "https://example.com/functions/v1/print-agent",
+                    "apiKey": "shared-key",
+                }
+            },
+            "control_plane_token": "snake-token",
+            "workstationId": "backend-ws-234",
+            "warehouseId": "warehouse-1",
+        }
+
+        try:
+            with patch.object(LocalConfigStore, "get_app_data_dir", return_value=app_dir), \
+                 patch.object(print_agent.requests, "post", return_value=response), \
+                 patch.object(print_agent.SecureStorage, "set_control_plane_token") as set_token, \
+                 patch.object(print_agent.SecureStorage, "clear_control_plane_token"), \
+                 patch.object(print_agent.ConnectorManager, "_store_secrets"), \
+                 patch.object(print_agent.LocalConfigStore, "save_config_to_env"):
+                manager = print_agent.ConnectorManager("https://example.com/functions/v1/print-agent", "shared-key")
+                result = manager.pair_with_code("ABC123")
+        finally:
+            if app_dir.exists():
+                shutil.rmtree(app_dir)
+
+        self.assertTrue(result["success"])
+        set_token.assert_called_once_with("snake-token")
+
+    def test_pair_with_code_requires_control_plane_token(self) -> None:
+        app_dir = Path("test-output-pair-token-missing")
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        app_dir.mkdir(parents=True)
+
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "success": True,
+            "config": {
+                "edgeFunctions": {
+                    "sharedUrl": "https://example.com/functions/v1/print-agent",
+                    "apiKey": "shared-key",
+                }
+            },
+            "workstationId": "backend-ws-345",
+            "warehouseId": "warehouse-1",
+        }
+
+        try:
+            with patch.object(LocalConfigStore, "get_app_data_dir", return_value=app_dir), \
+                 patch.object(print_agent.requests, "post", return_value=response), \
+                 patch.object(print_agent.SecureStorage, "set_control_plane_token") as set_token, \
+                 patch.object(print_agent.SecureStorage, "clear_control_plane_token") as clear_token, \
+                 patch.object(print_agent.ConnectorManager, "_store_secrets"), \
+                 patch.object(print_agent.LocalConfigStore, "save_config_to_env"):
+                manager = print_agent.ConnectorManager("https://example.com/functions/v1/print-agent", "shared-key")
+                result = manager.pair_with_code("ABC123")
+        finally:
+            if app_dir.exists():
+                shutil.rmtree(app_dir)
+
+        self.assertFalse(result["success"])
+        self.assertIn("control-plane token", result["error"])
+        clear_token.assert_called_once()
+        set_token.assert_not_called()
+
     def test_pair_with_code_hydrates_runtime_config_when_pair_response_config_is_empty(self) -> None:
         app_dir = Path("test-output-pair-config-hydrate")
         if app_dir.exists():
