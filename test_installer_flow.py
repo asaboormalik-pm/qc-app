@@ -78,6 +78,41 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertIn("POLL_INTERVAL_SECONDS=5", env_text)
         self.assertIn("PRINTER_PORT=9109", env_text)
 
+    def test_save_config_to_env_persists_erp_settings(self) -> None:
+        store = LocalConfigStore()
+        config = {
+            "edgeFunctions": {
+                "sharedUrl": "https://example.com/functions/v1/print-agent",
+                "erpAgentUrl": "https://example.com/functions/v1/erp-agent",
+                "apiKey": "shared-key",
+            },
+            "erp": {
+                "endpoints": {
+                    "erp_box_fetch": {"url": "https://erp.example.com/boxes", "method": "GET"},
+                    "completion_event": {"url": "https://erp.example.com/completion", "method": "POST"},
+                }
+            },
+        }
+
+        tmpdir = Path("test-output-save-config-erp")
+        if tmpdir.exists():
+            shutil.rmtree(tmpdir)
+        tmpdir.mkdir(parents=True)
+        original_cwd = os.getcwd()
+        os.chdir(tmpdir)
+        try:
+            store.save_config_to_env(config)
+            env_text = Path(".env").read_text(encoding="utf-8")
+        finally:
+            os.chdir(original_cwd)
+            shutil.rmtree(tmpdir)
+
+        self.assertIn("ERP_ENABLED=true", env_text)
+        self.assertIn("ERP_AGENT_ENABLED=true", env_text)
+        self.assertIn("ERP_AGENT_URL=https://example.com/functions/v1/erp-agent", env_text)
+        self.assertIn("ERP_AGENT_API_KEY=shared-key", env_text)
+        self.assertIn("ERP_ENDPOINTS_JSON=", env_text)
+
     def test_pair_with_code_persists_backend_workstation_id_to_state(self) -> None:
         app_dir = Path("test-output-pair-state")
         if app_dir.exists():
@@ -457,6 +492,19 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertEqual(display_state["status"], "Connected")
         self.assertEqual(display_state["timer"], "Connected for: 01:00:00")
 
+    def test_connection_status_widget_truncates_long_workstation_id(self) -> None:
+        display_state = ConnectionStatusWidget._build_display_state(
+            {
+                "station_name": None,
+                "workstation_id": "c8364ce9-9ba1-4dee-ae29-d1c9f2717041",
+                "connection_status": "paired_active",
+                "paired_at": "2026-01-01T00:00:00+00:00",
+            },
+            now=datetime(2026, 1, 1, 0, 0, 5, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(display_state["title"], "c8364ce9...f2717041")
+
     def test_handle_local_pair_again_clears_state_launches_setup_and_restarts(self) -> None:
         args = SimpleNamespace(console=False)
         store = Mock()
@@ -522,6 +570,40 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertEqual(kwargs["payload"], {"test": True})
         self.assertIn("correlation_id", kwargs)
         self.assertIn("idempotency_key", kwargs)
+
+    def test_load_paired_config_supports_nested_backend_erp_config(self) -> None:
+        app_dir = Path("test-output-paired-config-nested")
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        app_dir.mkdir(parents=True)
+
+        config_json = {
+            "edgeFunctions": {
+                "sharedUrl": "https://example.com/functions/v1/print-agent",
+                "erpAgentUrl": "https://example.com/functions/v1/erp-agent",
+            },
+            "erp": {
+                "auth": {"mode": "none"},
+                "endpoints": {
+                    "erp_box_fetch": {"url": "https://erp.example.com/boxes", "method": "GET"},
+                },
+            },
+        }
+
+        try:
+            with patch.object(LocalConfigStore, "get_app_data_dir", return_value=app_dir), \
+                 patch.object(SecureStorage, "get_shared_api_key", return_value="shared-key"):
+                store = LocalConfigStore()
+                store.save_config(config_json)
+                config = print_agent._load_paired_config(store)
+        finally:
+            if app_dir.exists():
+                shutil.rmtree(app_dir)
+
+        self.assertTrue(config.erp_enabled)
+        self.assertTrue(config.erp_agent_enabled)
+        self.assertEqual(config.erp_agent_url, "https://example.com/functions/v1/erp-agent")
+        self.assertIn("erp_box_fetch", config.erp_endpoints)
 
 
 if __name__ == "__main__":

@@ -138,6 +138,20 @@ def _bootstrap_env_is_valid(path: Path) -> bool:
     return all(values.get(key, "").strip() for key in required_keys)
 
 
+def _get_nested_config_value(config: Dict[str, Any], *paths: str) -> Optional[Any]:
+    for path in paths:
+        current: Any = config
+        found = True
+        for segment in path.split("."):
+            if not isinstance(current, dict) or segment not in current:
+                found = False
+                break
+            current = current[segment]
+        if found and current not in (None, ""):
+            return current
+    return None
+
+
 def ensure_env_file_exists() -> None:
     """Create or heal .env from .env.example when bootstrap config is missing.
 
@@ -290,14 +304,20 @@ class LocalConfigStore:
             return
 
         def get_config_value(*keys: str) -> Optional[Any]:
-            for key in keys:
+            direct_keys = [key for key in keys if "." not in key]
+            nested_keys = [key for key in keys if "." in key]
+            for key in direct_keys:
                 value = config.get(key)
+                if value not in (None, ""):
+                    return value
+            if nested_keys:
+                value = _get_nested_config_value(config, *nested_keys)
                 if value not in (None, ""):
                     return value
             return None
 
         # Add PRINT_AGENT_CALLBACK_URL
-        print_agent_url = get_config_value("print_agent_url", "printAgentUrl")
+        print_agent_url = get_config_value("print_agent_url", "printAgentUrl", "edgeFunctions.sharedUrl", "edgeFunctions.printAgentUrl")
         if not print_agent_url:
             edge_functions = config.get("edgeFunctions", {})
             if isinstance(edge_functions, dict):
@@ -306,7 +326,7 @@ class LocalConfigStore:
             env_vars.append(f'PRINT_AGENT_CALLBACK_URL={print_agent_url}')
 
         # Add PRINT_AGENT_API_KEY
-        print_agent_api_key = get_config_value("print_agent_api_key", "printAgentApiKey", "apiKey")
+        print_agent_api_key = get_config_value("print_agent_api_key", "printAgentApiKey", "apiKey", "edgeFunctions.apiKey")
         if not print_agent_api_key:
             edge_functions = config.get("edgeFunctions", {})
             if isinstance(edge_functions, dict):
@@ -328,6 +348,31 @@ class LocalConfigStore:
             env_vars.append(f'PRINTER_PORT={printer_port}')
         if printer_timeout_seconds is not None:
             env_vars.append(f'PRINTER_TIMEOUT_SECONDS={printer_timeout_seconds}')
+
+        erp_endpoints = get_config_value("erp_endpoints_json", "erp.endpoints")
+        if isinstance(erp_endpoints, dict):
+            erp_endpoints = json.dumps(erp_endpoints)
+        elif isinstance(erp_endpoints, list):
+            erp_endpoints = json.dumps(erp_endpoints)
+
+        erp_agent_url = get_config_value("erp_agent_url", "erpAgentUrl", "edgeFunctions.erpAgentUrl")
+        erp_auth_mode = get_config_value("erp_auth_mode", "erp.auth.mode") or "none"
+        erp_auth_static_headers = get_config_value("erp_auth_static_headers", "erp.auth.staticHeaders")
+        if isinstance(erp_auth_static_headers, dict):
+            erp_auth_static_headers = json.dumps(erp_auth_static_headers)
+
+        env_vars.append("ERP_ENABLED=true")
+        env_vars.append("ERP_AGENT_ENABLED=true")
+        if erp_endpoints:
+            env_vars.append(f"ERP_ENDPOINTS_JSON={erp_endpoints}")
+        if erp_agent_url:
+            env_vars.append(f"ERP_AGENT_URL={erp_agent_url}")
+        if print_agent_api_key:
+            env_vars.append(f"ERP_AGENT_API_KEY={print_agent_api_key}")
+        if erp_auth_mode:
+            env_vars.append(f"ERP_AUTH_MODE={erp_auth_mode}")
+        if erp_auth_static_headers:
+            env_vars.append(f"ERP_AUTH_STATIC_HEADERS_JSON={erp_auth_static_headers}")
 
         if env_vars:
             with open(env_file, 'w', encoding='utf-8') as f:
@@ -1257,8 +1302,8 @@ class SetupWizard:
 class ConnectionStatusWidget:
     """Small floating status widget for the packaged connector."""
 
-    WIDTH = 320
-    HEIGHT = 180
+    WIDTH = 340
+    HEIGHT = 220
     MARGIN = 20
 
     def __init__(
@@ -1289,7 +1334,12 @@ class ConnectionStatusWidget:
     def _build_display_state(state: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, str]:
         station_name = state.get("station_name")
         workstation_id = state.get("workstation_id") or "Unknown workstation"
-        title = station_name or workstation_id
+        if station_name:
+            title = station_name
+        elif len(workstation_id) > 24:
+            title = f"{workstation_id[:8]}...{workstation_id[-8:]}"
+        else:
+            title = workstation_id
 
         connection_status = state.get("connection_status", "not_paired")
         status_map = {
@@ -1311,7 +1361,7 @@ class ConnectionStatusWidget:
 
         ttk.Label(container, text="QC Connector", font=("Helvetica", 12, "bold")).pack(anchor="w")
 
-        self.title_label = ttk.Label(container, text="", font=("Helvetica", 11, "bold"), wraplength=280)
+        self.title_label = ttk.Label(container, text="", font=("Helvetica", 11, "bold"), wraplength=300)
         self.title_label.pack(anchor="w", pady=(8, 4))
 
         self.status_label = ttk.Label(container, text="")
@@ -1320,11 +1370,14 @@ class ConnectionStatusWidget:
         self.timer_label = ttk.Label(container, text="")
         self.timer_label.pack(anchor="w", pady=(4, 8))
 
-        self.message_label = ttk.Label(container, text="", wraplength=280)
+        self.message_label = ttk.Label(container, text="", wraplength=300, justify=tk.LEFT)
         self.message_label.pack(anchor="w", pady=(0, 8))
 
+        self.spacer = ttk.Frame(container)
+        self.spacer.pack(fill=tk.BOTH, expand=True)
+
         button_row = ttk.Frame(container)
-        button_row.pack(fill=tk.X, pady=(6, 0))
+        button_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
 
         self.pair_again_button = ttk.Button(button_row, text="Pair Again", command=self._handle_pair_again, width=14)
         self.pair_again_button.pack(side=tk.LEFT, padx=(0, 8))
@@ -2790,7 +2843,12 @@ def _load_paired_config(store: LocalConfigStore) -> Config:
         raise ConfigError("No config found in paired storage")
 
     # Load configuration from JSON with fallbacks
-    print_agent_url = config_json.get("print_agent_url") or config_json.get("printAgentUrl", "")
+    print_agent_url = (
+        config_json.get("print_agent_url")
+        or config_json.get("printAgentUrl", "")
+        or _get_nested_config_value(config_json, "edgeFunctions.sharedUrl", "edgeFunctions.printAgentUrl")
+        or ""
+    )
     print_agent_api_key = secure.get_shared_api_key()
     if not print_agent_api_key:
         # Try loading from .env as fallback
@@ -2801,7 +2859,11 @@ def _load_paired_config(store: LocalConfigStore) -> Config:
         raise ConfigError("Missing required configuration: print_agent_url and print_agent_api_key")
 
     # Load ERP auth from keychain
-    erp_auth_mode = config_json.get("erp_auth_mode") or config_json.get("erp", {}).get("auth", {}).get("mode", "none")
+    erp_auth_mode = (
+        config_json.get("erp_auth_mode")
+        or _get_nested_config_value(config_json, "erp.auth.mode")
+        or "none"
+    )
 
     if erp_auth_mode == "basic":
         username, password = secure.get_erp_basic_auth()
@@ -2818,16 +2880,37 @@ def _load_paired_config(store: LocalConfigStore) -> Config:
         erp_auth_bearer_token = None
 
     # Parse ERP endpoints from config
-    erp_endpoints_raw = config_json.get("erp_endpoints_json", "{}")
-    if not erp_endpoints_raw and "erp" in config_json and "endpoints" in config_json["erp"]:
-        # Convert from new format
-        endpoints_dict = config_json["erp"]["endpoints"]
-        erp_endpoints_raw = json.dumps(endpoints_dict)
+    erp_endpoints_raw = config_json.get("erp_endpoints_json")
+    if not erp_endpoints_raw:
+        endpoints_dict = _get_nested_config_value(config_json, "erp.endpoints")
+        if endpoints_dict:
+            erp_endpoints_raw = json.dumps(endpoints_dict)
+    if not erp_endpoints_raw:
+        load_dotenv()
+        erp_endpoints_raw = os.getenv("ERP_ENDPOINTS_JSON", "{}")
 
     erp_default_timeout = config_json.get("erp_default_timeout_seconds", 10)
     erp_endpoints = parse_erp_endpoints(
         erp_endpoints_raw or "{}",
         default_timeout_seconds=float(erp_default_timeout),
+    )
+
+    erp_enabled = config_json.get("erp_enabled")
+    if erp_enabled is None:
+        erp_enabled = _get_nested_config_value(config_json, "erp.enabled")
+    if erp_enabled is None:
+        erp_enabled = True
+
+    erp_agent_enabled = config_json.get("erp_agent_enabled")
+    if erp_agent_enabled is None:
+        erp_agent_enabled = _get_nested_config_value(config_json, "erp.agent.enabled")
+    if erp_agent_enabled is None:
+        erp_agent_enabled = True
+
+    erp_agent_url = (
+        config_json.get("erp_agent_url")
+        or _get_nested_config_value(config_json, "edgeFunctions.erpAgentUrl", "erp.agent.url")
+        or os.getenv("ERP_AGENT_URL", "")
     )
 
     config = Config(
@@ -2838,13 +2921,13 @@ def _load_paired_config(store: LocalConfigStore) -> Config:
         printer_timeout_seconds=config_json.get("printer_timeout_seconds", 5.0),
         max_concurrent_jobs=config_json.get("max_concurrent_jobs", 3),
         workstation_id=store.get_workstation_id(),
-        erp_enabled=config_json.get("erp_enabled", False),
+        erp_enabled=bool(erp_enabled),
         erp_endpoints=erp_endpoints,
         erp_auth_mode=erp_auth_mode,
         erp_auth_bearer_token=erp_auth_bearer_token,
         erp_auth_basic_username=erp_auth_basic_username,
         erp_auth_basic_password=erp_auth_basic_password,
-        erp_auth_static_headers=config_json.get("erp_auth_static_headers", {}),
+        erp_auth_static_headers=config_json.get("erp_auth_static_headers", {}) or _get_nested_config_value(config_json, "erp.auth.staticHeaders") or {},
         erp_retry_attempts=config_json.get("erp_retry_attempts", 0),
         erp_retry_backoff_seconds=config_json.get("erp_retry_backoff_seconds", 1.0),
         erp_default_timeout_seconds=config_json.get("erp_default_timeout_seconds", 10.0),
@@ -2853,8 +2936,8 @@ def _load_paired_config(store: LocalConfigStore) -> Config:
         erp_retry_backoff_base_seconds=config_json.get("erp_retry_backoff_base_seconds", 1.0),
         erp_retry_backoff_max_seconds=config_json.get("erp_retry_backoff_max_seconds", 60.0),
         erp_retry_jitter_seconds=config_json.get("erp_retry_jitter_seconds", 1.0),
-        erp_agent_enabled=config_json.get("erp_agent_enabled", False),
-        erp_agent_url=config_json.get("erp_agent_url", ""),
+        erp_agent_enabled=bool(erp_agent_enabled),
+        erp_agent_url=erp_agent_url,
         erp_agent_api_key=print_agent_api_key,  # Use same API key for ERP agent
         erp_agent_poll_interval_seconds=config_json.get("erp_agent_poll_interval_seconds", 2.0),
         erp_agent_max_concurrent_requests=config_json.get("erp_agent_max_concurrent_requests", 2),
@@ -2878,7 +2961,7 @@ def _load_legacy_env_config() -> Config:
         workstation_id = str(uuid.uuid4())
         logging.info("Generated runtime WORKSTATION_ID=%s (not persisted to .env)", workstation_id)
 
-    erp_enabled = parse_bool_env("ERP_ENABLED", default=False)
+    erp_enabled = parse_bool_env("ERP_ENABLED", default=True)
     erp_default_timeout_seconds = float(os.getenv("ERP_DEFAULT_TIMEOUT_SECONDS", "10"))
     if erp_default_timeout_seconds <= 0:
         raise ValueError(
@@ -2971,7 +3054,7 @@ def _load_legacy_env_config() -> Config:
         )
 
     # ERP-agent specific settings
-    erp_agent_enabled = parse_bool_env("ERP_AGENT_ENABLED", default=False)
+    erp_agent_enabled = parse_bool_env("ERP_AGENT_ENABLED", default=True)
     erp_agent_url = os.getenv("ERP_AGENT_URL", "").strip()
     erp_agent_api_key = os.getenv("ERP_AGENT_API_KEY", "").strip() or ""
     erp_agent_poll_interval = float(os.getenv("ERP_AGENT_POLL_INTERVAL_SECONDS", "2"))
