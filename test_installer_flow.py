@@ -331,7 +331,61 @@ class InstallerHelperTests(unittest.TestCase):
         self.assertTrue(event_was_set)
         ack_unpair.assert_called_once()
         clear_secrets.assert_called_once()
+        show_info.assert_not_called()
+
+    def test_handle_remote_disconnect_is_idempotent(self) -> None:
+        app_dir = Path("test-output-remote-unpaired-idempotent")
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        app_dir.mkdir(parents=True)
+
+        try:
+            with patch.object(LocalConfigStore, "get_app_data_dir", return_value=app_dir), \
+                 patch.object(print_agent, "_clear_connector_secrets") as clear_secrets, \
+                 patch.object(print_agent.ConnectorManager, "acknowledge_unpair", return_value=True) as ack_unpair:
+                print_agent._consume_remote_disconnect_reason()
+                manager = print_agent.ConnectorManager("https://example.com/functions/v1/print-agent", "shared-key")
+                manager.store.save_state({
+                    "workstation_id": "ws-1",
+                    "is_paired": True,
+                    "connection_status": "paired_active",
+                    "paired_at": "2026-01-01T00:00:00+00:00",
+                    "warehouse_id": "wh-1",
+                    "station_name": "Station A",
+                })
+
+                manager.handle_remote_disconnect("device_unpaired_by_admin")
+                manager.handle_remote_disconnect("device_registration_revoked")
+        finally:
+            print_agent._consume_remote_disconnect_reason()
+            if app_dir.exists():
+                shutil.rmtree(app_dir)
+
+        ack_unpair.assert_called_once()
+        clear_secrets.assert_called_once()
+
+    def test_handle_runtime_remote_disconnect_reopens_setup_and_restarts(self) -> None:
+        args = SimpleNamespace(console=False)
+        print_agent._consume_remote_disconnect_reason()
+        self.assertTrue(print_agent._record_remote_disconnect("device_unpaired_by_admin"))
+
+        with patch.object(print_agent, "remove_pid_file") as remove_pid, \
+             patch.object(print_agent, "show_info_message") as show_info, \
+             patch.object(print_agent, "_resolve_bootstrap_pairing_config", return_value=Config(
+                 print_agent_url="https://example.com/functions/v1/print-agent",
+                 print_agent_api_key="shared-key",
+             )), \
+             patch.object(print_agent, "ConnectorManager") as manager_cls, \
+             patch.object(print_agent, "_launch_setup_wizard", return_value=True) as launch_setup, \
+             patch.object(print_agent, "_restart_current_process") as restart_process:
+            print_agent._handle_runtime_remote_disconnect(args)
+
+        remove_pid.assert_called_once()
         show_info.assert_called_once()
+        manager_cls.assert_called_once_with("https://example.com/functions/v1/print-agent", "shared-key")
+        launch_setup.assert_called_once()
+        restart_process.assert_called_once_with(args)
+        self.assertIsNone(print_agent._consume_remote_disconnect_reason())
 
     def test_acknowledge_unpair_posts_expected_request(self) -> None:
         response = Mock()

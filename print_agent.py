@@ -217,6 +217,8 @@ MAX_CONCURRENT_JOBS=3
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_CALLBACK_RETRIES = 3
 REMOTE_UNPAIRED_EVENT = threading.Event()
+REMOTE_UNPAIRED_LOCK = threading.Lock()
+REMOTE_UNPAIRED_REASON: Optional[str] = None
 
 
 class ConfigError(Exception):
@@ -1038,16 +1040,13 @@ class ConnectorManager:
             return False
 
     def handle_remote_disconnect(self, reason: str) -> None:
+        if not _record_remote_disconnect(reason):
+            return
         ack_success = self.acknowledge_unpair()
         self.store.mark_server_unpaired(reason)
         self.store.clear_local_runtime_state(include_pid_file=False)
         _clear_connector_secrets()
-        REMOTE_UNPAIRED_EVENT.set()
         logging.warning("[CONNECTOR] Remote disconnect detected reason=%s ack_success=%s", reason, ack_success)
-        show_info_message(
-            "Connection Removed",
-            "This device was disconnected from the warehouse.\n\nPlease pair again to continue.",
-        )
 
     def verify_registration(self) -> bool:
         """Verify that this device is still registered on the server.
@@ -3031,6 +3030,55 @@ def _clear_local_pairing_state(store: LocalConfigStore) -> None:
     logging.info("Cleared local pairing state and runtime files")
 
 
+def _record_remote_disconnect(reason: str) -> bool:
+    global REMOTE_UNPAIRED_REASON
+    with REMOTE_UNPAIRED_LOCK:
+        if REMOTE_UNPAIRED_EVENT.is_set():
+            logging.info("Remote disconnect already recorded; ignoring duplicate reason=%s", reason)
+            return False
+        REMOTE_UNPAIRED_REASON = reason
+        REMOTE_UNPAIRED_EVENT.set()
+        return True
+
+
+def _consume_remote_disconnect_reason() -> Optional[str]:
+    global REMOTE_UNPAIRED_REASON
+    with REMOTE_UNPAIRED_LOCK:
+        reason = REMOTE_UNPAIRED_REASON
+        REMOTE_UNPAIRED_REASON = None
+        REMOTE_UNPAIRED_EVENT.clear()
+        return reason
+
+
+def _restart_current_process(args: Any) -> None:
+    restart_args = [sys.executable]
+    if not getattr(sys, "frozen", False):
+        restart_args.append(Path(__file__).resolve().as_posix())
+    restart_args.extend(
+        arg for arg in sys.argv[1:]
+        if arg not in {"--setup", "--reset-pairing"}
+    )
+    logging.info("Restarting process with args=%s", restart_args)
+    os.execv(sys.executable, restart_args)
+
+
+def _handle_runtime_remote_disconnect(args: Any) -> None:
+    reason = _consume_remote_disconnect_reason()
+    if not reason:
+        return
+
+    remove_pid_file()
+    show_info_message(
+        "Connection Disconnected",
+        "This connector was disconnected from the warehouse.\n\nPlease pair again to continue.",
+    )
+    bootstrap_config = _resolve_bootstrap_pairing_config()
+    manager = ConnectorManager(bootstrap_config.print_agent_url, bootstrap_config.print_agent_api_key)
+    if not _launch_setup_wizard(manager, args, reason="runtime-remote-disconnect"):
+        sys.exit(1)
+    _restart_current_process(args)
+
+
 def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str) -> bool:
     logging.info("Setup wizard path selected reason=%s console=%s tkinter=%s", reason, args.console, TKINTER_AVAILABLE)
 
@@ -3154,7 +3202,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    REMOTE_UNPAIRED_EVENT.clear()
+    _consume_remote_disconnect_reason()
     ensure_env_file_exists()
     load_dotenv()
     startup_log_path = setup_startup_logging(force_file=getattr(sys, "frozen", False) and not args.console)
@@ -3271,12 +3319,23 @@ def main() -> None:
         store.get_log_path(),
         store.is_paired(),
     )
+    state = store.load_state()
+    connection_status = state.get("connection_status", "not_paired")
     if not store.is_paired():
-        logging.info("First-run setup branch selected")
-        print("QC Print Agent - First Run Setup")
+        reconnecting = connection_status == "server_unpaired"
+        logging.info("Setup-required startup branch selected reconnecting=%s connection_status=%s", reconnecting, connection_status)
+        print("QC Print Agent - Connection Setup")
         print("=" * 40)
-        print("This appears to be your first time running the agent.")
-        print("Launching setup wizard to pair with your warehouse...")
+        if reconnecting:
+            show_info_message(
+                "Connection Disconnected",
+                "This connector is no longer connected to the warehouse.\n\nPlease pair again to continue.",
+            )
+            print("The previous connection is no longer active.")
+            print("Launching setup wizard to reconnect to your warehouse...")
+        else:
+            print("This appears to be your first time running the agent.")
+            print("Launching setup wizard to pair with your warehouse...")
         print()
 
         # Check if tkinter is available
@@ -3293,9 +3352,10 @@ def main() -> None:
             if not _launch_setup_wizard(
                 manager,
                 args,
-                reason="auto-first-run",
+                reason="auto-reconnect" if reconnecting else "auto-first-run",
             ):
                 sys.exit(1)
+            _restart_current_process(args)
         except Exception as exc:
             logging.exception("Auto first-run setup failed before wizard launch: %s", exc)
             print(f"\nSetup failed: {exc}")
@@ -3328,6 +3388,7 @@ def main() -> None:
                 reason="registration-reset",
             ):
                 sys.exit(1)
+            _restart_current_process(args)
     except Exception as exc:
         # On network errors, continue anyway (might be temporary)
         logging.warning("Registration verification failed, continuing with local state: %s", exc)
@@ -3394,6 +3455,8 @@ def main() -> None:
 
         # Run print loop in main thread
         agent.run_forever()
+        if REMOTE_UNPAIRED_EVENT.is_set():
+            _handle_runtime_remote_disconnect(args)
     except KeyboardInterrupt:
         logging.info("Interrupted by user")
     except Exception as exc:
