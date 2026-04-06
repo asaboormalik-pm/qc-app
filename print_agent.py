@@ -1350,8 +1350,8 @@ class SetupWizard:
 class ConnectionStatusWidget:
     """Small floating status widget for the packaged connector."""
 
-    WIDTH = 340
-    HEIGHT = 220
+    MIN_WIDTH = 380
+    MIN_HEIGHT = 240
     MARGIN = 20
 
     def __init__(
@@ -1409,7 +1409,7 @@ class ConnectionStatusWidget:
 
         ttk.Label(container, text="QC Connector", font=("Helvetica", 12, "bold")).pack(anchor="w")
 
-        self.title_label = ttk.Label(container, text="", font=("Helvetica", 11, "bold"), wraplength=300)
+        self.title_label = ttk.Label(container, text="", font=("Helvetica", 11, "bold"), wraplength=330, justify=tk.LEFT)
         self.title_label.pack(anchor="w", pady=(8, 4))
 
         self.status_label = ttk.Label(container, text="")
@@ -1418,27 +1418,29 @@ class ConnectionStatusWidget:
         self.timer_label = ttk.Label(container, text="")
         self.timer_label.pack(anchor="w", pady=(4, 8))
 
-        self.message_label = ttk.Label(container, text="", wraplength=300, justify=tk.LEFT)
+        self.message_label = ttk.Label(container, text="", wraplength=330, justify=tk.LEFT)
         self.message_label.pack(anchor="w", pady=(0, 8))
 
         self.spacer = ttk.Frame(container)
         self.spacer.pack(fill=tk.BOTH, expand=True)
 
-        button_row = ttk.Frame(container)
-        button_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        button_column = ttk.Frame(container)
+        button_column.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
 
-        self.pair_again_button = ttk.Button(button_row, text="Pair Again", command=self._handle_pair_again, width=14)
-        self.pair_again_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.pair_again_button = ttk.Button(button_column, text="Pair Again", command=self._handle_pair_again)
+        self.pair_again_button.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Button(button_row, text="Minimize", command=self.on_minimize, width=12).pack(side=tk.LEFT)
+        ttk.Button(button_column, text="Minimize", command=self.on_minimize).pack(fill=tk.X)
 
     def _position_window(self) -> None:
         self.root.update_idletasks()
+        width = max(self.MIN_WIDTH, self.root.winfo_reqwidth())
+        height = max(self.MIN_HEIGHT, self.root.winfo_reqheight())
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        x = max(0, screen_width - self.WIDTH - self.MARGIN)
-        y = max(0, screen_height - self.HEIGHT - self.MARGIN - 40)
-        self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+        x = max(0, screen_width - width - self.MARGIN)
+        y = max(0, screen_height - height - self.MARGIN - 40)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def _set_action_state(self, active: bool, message: str = "") -> None:
         self.action_in_progress = active
