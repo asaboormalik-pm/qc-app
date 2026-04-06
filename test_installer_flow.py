@@ -8,12 +8,13 @@ import shutil
 import time
 import unittest
 import builtins
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import print_agent
-from print_agent import Config, ConfigError, ErpEndpointConfig, LocalConfigStore, PrintAgent, SecureStorage, SetupWizard
+from print_agent import Config, ConfigError, ConnectionStatusWidget, ErpEndpointConfig, LocalConfigStore, PrintAgent, SecureStorage, SetupWizard
 
 
 class SetupWizardBehaviorTests(unittest.TestCase):
@@ -432,6 +433,65 @@ class InstallerHelperTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertFalse(pid_file.exists())
+
+    def test_format_connected_duration_uses_paired_at(self) -> None:
+        formatted = print_agent._format_connected_duration(
+            "2026-01-01T00:00:00+00:00",
+            now=datetime(2026, 1, 1, 2, 3, 4, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(formatted, "02:03:04")
+
+    def test_connection_status_widget_builds_display_state(self) -> None:
+        display_state = ConnectionStatusWidget._build_display_state(
+            {
+                "station_name": "Station A",
+                "workstation_id": "ws-1",
+                "connection_status": "paired_active",
+                "paired_at": "2026-01-01T00:00:00+00:00",
+            },
+            now=datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(display_state["title"], "Station A")
+        self.assertEqual(display_state["status"], "Connected")
+        self.assertEqual(display_state["timer"], "Connected for: 01:00:00")
+
+    def test_handle_local_pair_again_clears_state_launches_setup_and_restarts(self) -> None:
+        args = SimpleNamespace(console=False)
+        store = Mock()
+
+        with patch.object(print_agent, "remove_pid_file") as remove_pid, \
+             patch.object(print_agent, "LocalConfigStore", return_value=store), \
+             patch.object(print_agent, "_clear_local_pairing_state") as clear_pairing, \
+             patch.object(print_agent, "_resolve_bootstrap_pairing_config", return_value=Config(
+                 print_agent_url="https://example.com/functions/v1/print-agent",
+                 print_agent_api_key="shared-key",
+             )), \
+             patch.object(print_agent, "ConnectorManager") as manager_cls, \
+             patch.object(print_agent, "_launch_setup_wizard", return_value=True) as launch_setup, \
+             patch.object(print_agent, "_restart_current_process") as restart_process:
+            print_agent._handle_local_pair_again(args)
+
+        remove_pid.assert_called_once()
+        clear_pairing.assert_called_once_with(store)
+        manager_cls.assert_called_once_with("https://example.com/functions/v1/print-agent", "shared-key")
+        launch_setup.assert_called_once()
+        restart_process.assert_called_once_with(args)
+
+    def test_heartbeat_loop_exits_when_stop_event_is_set(self) -> None:
+        stop_event = print_agent.threading.Event()
+        manager = print_agent.ConnectorManager(
+            "https://example.com/functions/v1/print-agent",
+            "shared-key",
+            stop_event=stop_event,
+        )
+
+        with patch.object(manager, "send_heartbeat", side_effect=lambda *_: stop_event.set() or "connected"), \
+             patch.object(print_agent.time, "sleep") as sleep_mock:
+            manager.run_heartbeat_loop()
+
+        sleep_mock.assert_not_called()
 
     def test_test_erp_connection_uses_current_helper_signature(self) -> None:
         config = Config(

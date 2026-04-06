@@ -221,6 +221,29 @@ REMOTE_UNPAIRED_LOCK = threading.Lock()
 REMOTE_UNPAIRED_REASON: Optional[str] = None
 
 
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _format_connected_duration(paired_at: Optional[str], now: Optional[datetime] = None) -> str:
+    started_at = _parse_iso_datetime(paired_at)
+    if started_at is None:
+        return "--:--:--"
+    current = now or datetime.now(timezone.utc)
+    elapsed_seconds = max(0, int((current - started_at).total_seconds()))
+    hours, remainder = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 class ConfigError(Exception):
     """Configuration error exception."""
     pass
@@ -819,13 +842,14 @@ class ErpAgentClient:
 class ConnectorManager:
     """Handles pairing, config refresh, and heartbeat for installed connector."""
 
-    def __init__(self, api_base: str, shared_api_key: str):
+    def __init__(self, api_base: str, shared_api_key: str, stop_event: Optional[threading.Event] = None):
         self.api_base = api_base
         self.shared_api_key = shared_api_key
         self.store = LocalConfigStore()
         self.secure = SecureStorage()
         self.workstation_id = self.store.get_workstation_id()
         self.state = self.store.load_state()
+        self.stop_event = stop_event or threading.Event()
 
     def pair_with_code(self, pairing_code: str, station_name: str = None) -> Dict[str, Any]:
         """Redeem pairing code and receive initial config from backend.
@@ -984,14 +1008,17 @@ class ConnectorManager:
 
     def run_heartbeat_loop(self) -> None:
         """Background thread sending heartbeat every 30 seconds."""
-        while True:
+        while not self.stop_event.is_set():
             heartbeat_status = self.send_heartbeat("online")
             if heartbeat_status in {"unpaired", "revoked"}:
                 self.handle_remote_disconnect(
                     "device_unpaired_by_admin" if heartbeat_status == "unpaired" else "device_registration_revoked"
                 )
                 return
-            time.sleep(30)
+            for _ in range(300):
+                if self.stop_event.is_set():
+                    return
+                time.sleep(0.1)
 
     def _classify_registration_response(self, response: requests.Response) -> str:
         if response.status_code == 401:
@@ -1225,6 +1252,136 @@ class SetupWizard:
         """Start the Tkinter main loop."""
         self.root.mainloop()
         return self.paired_successfully
+
+
+class ConnectionStatusWidget:
+    """Small floating status widget for the packaged connector."""
+
+    WIDTH = 320
+    HEIGHT = 180
+    MARGIN = 20
+
+    def __init__(
+        self,
+        store: LocalConfigStore,
+        on_pair_again: Any,
+        on_remote_disconnect: Any,
+    ) -> None:
+        if not TKINTER_AVAILABLE:
+            raise RuntimeError("Tkinter is required for ConnectionStatusWidget")
+
+        self.store = store
+        self.on_pair_again = on_pair_again
+        self.on_remote_disconnect = on_remote_disconnect
+        self.action_in_progress = False
+
+        self.root = tk.Tk()
+        self.root.title("QC Connector")
+        self.root.resizable(False, False)
+        self.root.attributes("-topmost", True)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_minimize)
+
+        self._build_widgets()
+        self._position_window()
+        self._refresh()
+
+    @staticmethod
+    def _build_display_state(state: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, str]:
+        station_name = state.get("station_name")
+        workstation_id = state.get("workstation_id") or "Unknown workstation"
+        title = station_name or workstation_id
+
+        connection_status = state.get("connection_status", "not_paired")
+        status_map = {
+            "paired_active": "Connected",
+            "server_unpaired": "Disconnected",
+            "not_paired": "Reconnecting",
+        }
+        status_text = status_map.get(connection_status, connection_status.replace("_", " ").title())
+        timer_text = _format_connected_duration(state.get("paired_at"), now=now)
+        return {
+            "title": title,
+            "status": status_text,
+            "timer": f"Connected for: {timer_text}",
+        }
+
+    def _build_widgets(self) -> None:
+        container = ttk.Frame(self.root, padding=14)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text="QC Connector", font=("Helvetica", 12, "bold")).pack(anchor="w")
+
+        self.title_label = ttk.Label(container, text="", font=("Helvetica", 11, "bold"), wraplength=280)
+        self.title_label.pack(anchor="w", pady=(8, 4))
+
+        self.status_label = ttk.Label(container, text="")
+        self.status_label.pack(anchor="w")
+
+        self.timer_label = ttk.Label(container, text="")
+        self.timer_label.pack(anchor="w", pady=(4, 8))
+
+        self.message_label = ttk.Label(container, text="", wraplength=280)
+        self.message_label.pack(anchor="w", pady=(0, 8))
+
+        button_row = ttk.Frame(container)
+        button_row.pack(fill=tk.X, pady=(6, 0))
+
+        self.pair_again_button = ttk.Button(button_row, text="Pair Again", command=self._handle_pair_again, width=14)
+        self.pair_again_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(button_row, text="Minimize", command=self.on_minimize, width=12).pack(side=tk.LEFT)
+
+    def _position_window(self) -> None:
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = max(0, screen_width - self.WIDTH - self.MARGIN)
+        y = max(0, screen_height - self.HEIGHT - self.MARGIN - 40)
+        self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+
+    def _set_action_state(self, active: bool, message: str = "") -> None:
+        self.action_in_progress = active
+        self.pair_again_button.configure(state=tk.DISABLED if active else tk.NORMAL)
+        if message:
+            self.message_label.configure(text=message)
+
+    def _refresh(self) -> None:
+        state = self.store.load_state()
+        display_state = self._build_display_state(state)
+        self.title_label.configure(text=display_state["title"])
+        self.status_label.configure(text=f"Status: {display_state['status']}")
+        self.timer_label.configure(text=display_state["timer"])
+
+        if not self.action_in_progress:
+            if state.get("connection_status") == "server_unpaired":
+                self.message_label.configure(text="Connection removed. Re-pair to continue.")
+            else:
+                self.message_label.configure(text="")
+
+        if REMOTE_UNPAIRED_EVENT.is_set() and not self.action_in_progress:
+            self._set_action_state(True, "Connection removed. Opening setup...")
+            self.root.after(150, self.on_remote_disconnect)
+            return
+
+        self.root.after(1000, self._refresh)
+
+    def _handle_pair_again(self) -> None:
+        if self.action_in_progress:
+            return
+        self._set_action_state(True, "Reconnecting to warehouse...")
+        self.root.after(50, self.on_pair_again)
+
+    def on_minimize(self) -> None:
+        self.root.iconify()
+
+    def close(self) -> None:
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def run(self) -> None:
+        self.root.mainloop()
 
 
 def console_pairing(connector_manager: ConnectorManager) -> bool:
@@ -3062,6 +3219,57 @@ def _restart_current_process(args: Any) -> None:
     os.execv(sys.executable, restart_args)
 
 
+class AgentRuntimeController:
+    """Starts and stops agent background work while a Tk widget owns the main thread."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.agent = PrintAgent(config)
+        self.store = LocalConfigStore()
+        self.stop_event = threading.Event()
+        self.connector = ConnectorManager(
+            api_base=config.print_agent_url,
+            shared_api_key=config.print_agent_api_key,
+            stop_event=self.stop_event,
+        )
+        self.print_thread: Optional[threading.Thread] = None
+        self.erp_thread: Optional[threading.Thread] = None
+        self.heartbeat_thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self.print_thread = threading.Thread(
+            target=self.agent.run_forever,
+            daemon=True,
+            name="PrintAgentLoop",
+        )
+        self.print_thread.start()
+
+        if self.config.erp_agent_enabled:
+            self.erp_thread = threading.Thread(
+                target=self.agent.run_erp_forever,
+                daemon=True,
+                name="ErpAgentLoop",
+            )
+            self.erp_thread.start()
+            logging.info("Started ERP-agent loop in background thread")
+
+        if self.store.is_paired():
+            self.heartbeat_thread = threading.Thread(
+                target=self.connector.run_heartbeat_loop,
+                daemon=True,
+                name="HeartbeatLoop",
+            )
+            self.heartbeat_thread.start()
+            logging.info("[CONNECTOR] Started heartbeat loop (workstation: %s)", self.connector.workstation_id)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.agent.shutdown_requested = True
+        for thread in (self.heartbeat_thread, self.erp_thread, self.print_thread):
+            if thread and thread.is_alive():
+                thread.join(timeout=5)
+
+
 def _handle_runtime_remote_disconnect(args: Any) -> None:
     reason = _consume_remote_disconnect_reason()
     if not reason:
@@ -3077,6 +3285,50 @@ def _handle_runtime_remote_disconnect(args: Any) -> None:
     if not _launch_setup_wizard(manager, args, reason="runtime-remote-disconnect"):
         sys.exit(1)
     _restart_current_process(args)
+
+
+def _handle_local_pair_again(args: Any) -> None:
+    remove_pid_file()
+    store = LocalConfigStore()
+    _clear_local_pairing_state(store)
+    bootstrap_config = _resolve_bootstrap_pairing_config()
+    manager = ConnectorManager(bootstrap_config.print_agent_url, bootstrap_config.print_agent_api_key)
+    if not _launch_setup_wizard(manager, args, reason="local-pair-again"):
+        sys.exit(1)
+    _restart_current_process(args)
+
+
+def _should_use_status_widget(args: Any) -> bool:
+    return TKINTER_AVAILABLE and not args.console and getattr(sys, "frozen", False)
+
+
+def _run_runtime_with_status_widget(config: Config, args: Any) -> None:
+    runtime = AgentRuntimeController(config)
+    runtime.start()
+
+    widget_holder: Dict[str, ConnectionStatusWidget] = {}
+
+    def pair_again_callback() -> None:
+        widget = widget_holder.get("widget")
+        if widget:
+            widget.close()
+        runtime.stop()
+        _handle_local_pair_again(args)
+
+    def remote_disconnect_callback() -> None:
+        widget = widget_holder.get("widget")
+        if widget:
+            widget.close()
+        runtime.stop()
+        _handle_runtime_remote_disconnect(args)
+
+    widget = ConnectionStatusWidget(
+        store=runtime.store,
+        on_pair_again=pair_again_callback,
+        on_remote_disconnect=remote_disconnect_callback,
+    )
+    widget_holder["widget"] = widget
+    widget.run()
 
 
 def _launch_setup_wizard(manager: ConnectorManager, args: Any, reason: str) -> bool:
@@ -3426,37 +3678,40 @@ def main() -> None:
     try:
         # Load config and start agent
         config = load_config()
-        agent = PrintAgent(config)
+        if _should_use_status_widget(args):
+            _run_runtime_with_status_widget(config, args)
+        else:
+            agent = PrintAgent(config)
 
-        # Start ERP-agent loop in background thread if enabled
-        erp_thread = None
-        if config.erp_agent_enabled:
-            erp_thread = threading.Thread(target=agent.run_erp_forever, daemon=True, name="ErpAgentLoop")
-            erp_thread.start()
-            logging.info("Started ERP-agent loop in background thread")
+            # Start ERP-agent loop in background thread if enabled
+            erp_thread = None
+            if config.erp_agent_enabled:
+                erp_thread = threading.Thread(target=agent.run_erp_forever, daemon=True, name="ErpAgentLoop")
+                erp_thread.start()
+                logging.info("Started ERP-agent loop in background thread")
 
-        # Start heartbeat loop if paired (for warehouse connector)
-        store = LocalConfigStore()
-        if store.is_paired():
-            try:
-                connector = ConnectorManager(
-                    api_base=config.print_agent_url,
-                    shared_api_key=config.print_agent_api_key
-                )
-                heartbeat_thread = threading.Thread(
-                    target=connector.run_heartbeat_loop,
-                    daemon=True,
-                    name="HeartbeatLoop"
-                )
-                heartbeat_thread.start()
-                logging.info(f"[CONNECTOR] Started heartbeat loop (workstation: {connector.workstation_id})")
-            except Exception as exc:
-                logging.warning(f"[CONNECTOR] Failed to start heartbeat loop: {exc}")
+            # Start heartbeat loop if paired (for warehouse connector)
+            store = LocalConfigStore()
+            if store.is_paired():
+                try:
+                    connector = ConnectorManager(
+                        api_base=config.print_agent_url,
+                        shared_api_key=config.print_agent_api_key
+                    )
+                    heartbeat_thread = threading.Thread(
+                        target=connector.run_heartbeat_loop,
+                        daemon=True,
+                        name="HeartbeatLoop"
+                    )
+                    heartbeat_thread.start()
+                    logging.info(f"[CONNECTOR] Started heartbeat loop (workstation: {connector.workstation_id})")
+                except Exception as exc:
+                    logging.warning(f"[CONNECTOR] Failed to start heartbeat loop: {exc}")
 
-        # Run print loop in main thread
-        agent.run_forever()
-        if REMOTE_UNPAIRED_EVENT.is_set():
-            _handle_runtime_remote_disconnect(args)
+            # Run print loop in main thread
+            agent.run_forever()
+            if REMOTE_UNPAIRED_EVENT.is_set():
+                _handle_runtime_remote_disconnect(args)
     except KeyboardInterrupt:
         logging.info("Interrupted by user")
     except Exception as exc:
