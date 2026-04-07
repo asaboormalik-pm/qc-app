@@ -233,7 +233,7 @@ DEFAULT_CALLBACK_RETRIES = 3
 REMOTE_UNPAIRED_EVENT = threading.Event()
 REMOTE_UNPAIRED_LOCK = threading.Lock()
 REMOTE_UNPAIRED_REASON: Optional[str] = None
-APP_VERSION = "1.1.12"
+APP_VERSION = "1.1.13"
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -1395,9 +1395,9 @@ class ConnectionStatusWidget:
         self.root.update_idletasks()
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        x = max(0, screen_width - width - self.MARGIN)
-        y = max(0, screen_height - height - self.MARGIN - 40)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        x = max(0, screen_width - self.WIDTH - self.MARGIN)
+        y = max(0, screen_height - self.HEIGHT - self.MARGIN - 40)
+        self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
 
     def _set_action_state(self, active: bool, message: str = "") -> None:
         self.action_in_progress = active

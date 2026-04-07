@@ -537,6 +537,17 @@ class InstallerHelperTests(unittest.TestCase):
 
         self.assertEqual(display_state["title"], "c8364ce9...f2717041")
 
+    def test_connection_status_widget_positions_using_widget_dimensions(self) -> None:
+        widget = ConnectionStatusWidget.__new__(ConnectionStatusWidget)
+        widget.root = Mock()
+        widget.root.winfo_screenwidth.return_value = 1920
+        widget.root.winfo_screenheight.return_value = 1080
+
+        widget._position_window()
+
+        widget.root.update_idletasks.assert_called_once()
+        widget.root.geometry.assert_called_once_with("380x240+1520+780")
+
     def test_handle_local_pair_again_clears_state_launches_setup_and_restarts(self) -> None:
         args = SimpleNamespace(console=False)
         store = Mock()

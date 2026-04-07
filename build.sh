@@ -61,7 +61,7 @@ if [ -d "dist/QC Print Agent.app" ]; then
 
     # Create README for installer
     cat > installers/README.txt << 'EOF'
-QC Print Agent v1.1.12
+QC Print Agent v1.1.13
 ========================
 
 Installation:
