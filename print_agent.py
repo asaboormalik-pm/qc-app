@@ -233,7 +233,7 @@ DEFAULT_CALLBACK_RETRIES = 3
 REMOTE_UNPAIRED_EVENT = threading.Event()
 REMOTE_UNPAIRED_LOCK = threading.Lock()
 REMOTE_UNPAIRED_REASON: Optional[str] = None
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.12"
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
