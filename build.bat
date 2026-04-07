@@ -58,7 +58,7 @@ if exist dist\qc-print-agent\qc-print-agent.exe (
     copy .env.example installers\.env.example >nul
 
     REM Create README for installer
-    echo QC Print Agent v1.0.0 > installers\README.txt
+    echo QC Print Agent v1.1.8 > installers\README.txt
     echo ======================== >> installers\README.txt
     echo. >> installers\README.txt
     echo Installation: >> installers\README.txt

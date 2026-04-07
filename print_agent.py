@@ -233,6 +233,7 @@ DEFAULT_CALLBACK_RETRIES = 3
 REMOTE_UNPAIRED_EVENT = threading.Event()
 REMOTE_UNPAIRED_LOCK = threading.Lock()
 REMOTE_UNPAIRED_REASON: Optional[str] = None
+APP_VERSION = "1.1.8"
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -524,14 +525,6 @@ class SecureStorage:
         """Retrieve per-device control-plane token."""
         import keyring
         return keyring.get_password(self.service_name, "control_plane_token")
-
-    def clear_control_plane_token(self) -> None:
-        """Remove the stored control-plane token only."""
-        import keyring
-        try:
-            keyring.delete_password(self.service_name, "control_plane_token")
-        except Exception:
-            pass
 
     def set_erp_basic_auth(self, username: str, password: str) -> None:
         """Store ERP basic auth credentials."""
@@ -914,7 +907,7 @@ class ConnectorManager:
         payload = {
             "code": pairing_code,
             "osType": platform_module.system().lower(),
-            "appVersion": "1.0.0"
+            "appVersion": APP_VERSION
         }
 
         try:
@@ -928,13 +921,20 @@ class ConnectorManager:
             if response.status_code == 200:
                 data = response.json()
                 if data.get("success"):
+                    # Store secrets in keychain
+                    config = data["config"]
+                    self._store_secrets(config)
+
+                    # Store non-secret config in app data
+                    self.store.save_config(config)
+
+                    # Save config to .env file for next run
+                    self.store.save_config_to_env(config)
+
                     # Store control-plane token
-                    control_plane_token = self._extract_control_plane_token(data)
-                    self.secure.clear_control_plane_token()
-                    if not control_plane_token:
-                        logging.error("[CONNECTOR] Pair response missing control-plane token")
-                        return {"success": False, "error": "Pair response did not include a control-plane token"}
-                    self.secure.set_control_plane_token(control_plane_token)
+                    control_plane_token = data.get("controlPlaneToken")
+                    if control_plane_token:
+                        self.secure.set_control_plane_token(control_plane_token)
 
                     # Update workstation_id from response (assigned by backend)
                     workstation_id = data.get("workstationId")
@@ -942,11 +942,6 @@ class ConnectorManager:
                         self.workstation_id = workstation_id
                         self.state["workstation_id"] = workstation_id
                         self.store.save_workstation_id(workstation_id)
-
-                    config = self._prepare_runtime_config_after_pair(data)
-                    self._store_secrets(config)
-                    self.store.save_config(config)
-                    self.store.save_config_to_env(config)
 
                     # Update pairing state
                     self.state["is_paired"] = True
@@ -977,70 +972,6 @@ class ConnectorManager:
         except Exception as e:
             logging.error(f"[CONNECTOR] Pairing error: {e}")
             return {"success": False, "error": str(e)}
-
-    @staticmethod
-    def _extract_control_plane_token(pair_response: Dict[str, Any]) -> Optional[str]:
-        token = pair_response.get("controlPlaneToken") or pair_response.get("control_plane_token")
-        if not token:
-            control_plane = pair_response.get("controlPlane")
-            if isinstance(control_plane, dict):
-                token = control_plane.get("token")
-        if isinstance(token, str):
-            token = token.strip()
-        return token or None
-
-    def _build_fallback_runtime_config(self) -> Dict[str, Any]:
-        env_values = _read_env_file_values(Path(".env"))
-        erp_agent_url = env_values.get("ERP_AGENT_URL", "").strip()
-        if not erp_agent_url and self.api_base:
-            erp_agent_url = self.api_base.replace("print-agent", "erp-agent")
-
-        erp_endpoints_raw = env_values.get("ERP_ENDPOINTS_JSON", "{}").strip() or "{}"
-        try:
-            erp_endpoints = json.loads(erp_endpoints_raw)
-        except json.JSONDecodeError:
-            erp_endpoints = {}
-
-        return {
-            "print_agent_url": self.api_base,
-            "edgeFunctions": {
-                "sharedUrl": self.api_base,
-                "apiKey": self.shared_api_key,
-                "erpAgentUrl": erp_agent_url,
-            },
-            "erp_enabled": True,
-            "erp_agent_enabled": True,
-            "erp_agent_url": erp_agent_url,
-            "erp_endpoints_json": json.dumps(erp_endpoints),
-            "erp": {
-                "enabled": True,
-                "agent": {
-                    "enabled": True,
-                    "url": erp_agent_url,
-                },
-                "endpoints": erp_endpoints,
-                "auth": {
-                    "mode": env_values.get("ERP_AUTH_MODE", "none").strip() or "none",
-                },
-            },
-            "poll_interval_seconds": float(env_values.get("POLL_INTERVAL_SECONDS", "2") or "2"),
-            "max_concurrent_jobs": int(env_values.get("MAX_CONCURRENT_JOBS", "3") or "3"),
-            "printer_port": int(env_values.get("PRINTER_PORT", "9100") or "9100"),
-            "printer_timeout_seconds": float(env_values.get("PRINTER_TIMEOUT_SECONDS", "5") or "5"),
-        }
-
-    def _prepare_runtime_config_after_pair(self, pair_response: Dict[str, Any]) -> Dict[str, Any]:
-        raw_config = pair_response.get("config")
-        if isinstance(raw_config, dict) and raw_config:
-            return raw_config
-
-        fetched_config = self.fetch_config()
-        if isinstance(fetched_config, dict) and fetched_config and "status" not in fetched_config:
-            logging.info("[CONNECTOR] Hydrated runtime config from config endpoint after pairing")
-            return fetched_config
-
-        logging.warning("[CONNECTOR] Pair response did not include usable config; synthesizing fallback runtime config")
-        return self._build_fallback_runtime_config()
 
     def fetch_config(self) -> Optional[Dict[str, Any]]:
         """Fetch latest config from backend."""
@@ -1100,7 +1031,7 @@ class ConnectorManager:
         payload = {
             "workstationId": self.workstation_id,
             "status": status,
-            "appVersion": "1.0.0",
+            "appVersion": APP_VERSION,
             "osType": platform_module.system().lower(),
             "lastError": error
         }
@@ -1229,10 +1160,16 @@ class ConnectorManager:
         """Extract and store secrets from config to keychain."""
 
         # Store shared API key
+        shared_api_key = None
         if "apiKey" in config:
-            self.secure.set_shared_api_key(config["apiKey"])
+            shared_api_key = config["apiKey"]
         elif "edgeFunctions" in config and "apiKey" in config["edgeFunctions"]:
-            self.secure.set_shared_api_key(config["edgeFunctions"]["apiKey"])
+            shared_api_key = config["edgeFunctions"]["apiKey"]
+
+        if isinstance(shared_api_key, str):
+            shared_api_key = shared_api_key.strip()
+        if shared_api_key:
+            self.secure.set_shared_api_key(shared_api_key)
 
         # Store ERP auth secrets
         if "erp" in config and "auth" in config["erp"]:
@@ -1372,8 +1309,8 @@ class SetupWizard:
 class ConnectionStatusWidget:
     """Small floating status widget for the packaged connector."""
 
-    MIN_WIDTH = 380
-    MIN_HEIGHT = 240
+    WIDTH = 380
+    HEIGHT = 240
     MARGIN = 20
 
     def __init__(
@@ -1456,8 +1393,6 @@ class ConnectionStatusWidget:
 
     def _position_window(self) -> None:
         self.root.update_idletasks()
-        width = max(self.MIN_WIDTH, self.root.winfo_reqwidth())
-        height = max(self.MIN_HEIGHT, self.root.winfo_reqheight())
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         x = max(0, screen_width - width - self.MARGIN)
@@ -2923,6 +2858,14 @@ def _load_paired_config(store: LocalConfigStore) -> Config:
     )
     print_agent_api_key = secure.get_shared_api_key()
     if not print_agent_api_key:
+        print_agent_api_key = (
+            config_json.get("print_agent_api_key")
+            or config_json.get("printAgentApiKey")
+            or config_json.get("apiKey")
+            or _get_nested_config_value(config_json, "edgeFunctions.apiKey")
+            or ""
+        )
+    if not print_agent_api_key:
         # Try loading from .env as fallback
         load_dotenv()
         print_agent_api_key = os.getenv("PRINT_AGENT_API_KEY", "")
@@ -2939,13 +2882,25 @@ def _load_paired_config(store: LocalConfigStore) -> Config:
 
     if erp_auth_mode == "basic":
         username, password = secure.get_erp_basic_auth()
-        erp_auth_basic_username = username
-        erp_auth_basic_password = password
+        erp_auth_basic_username = (
+            username
+            or config_json.get("erp_auth_basic_username")
+            or _get_nested_config_value(config_json, "erp.auth.basicUsername")
+        )
+        erp_auth_basic_password = (
+            password
+            or config_json.get("erp_auth_basic_password")
+            or _get_nested_config_value(config_json, "erp.auth.basicPassword")
+        )
         erp_auth_bearer_token = None
     elif erp_auth_mode == "bearer":
         erp_auth_basic_username = None
         erp_auth_basic_password = None
-        erp_auth_bearer_token = secure.get_erp_bearer_token()
+        erp_auth_bearer_token = (
+            secure.get_erp_bearer_token()
+            or config_json.get("erp_auth_bearer_token")
+            or _get_nested_config_value(config_json, "erp.auth.bearerToken")
+        )
     else:
         erp_auth_basic_username = None
         erp_auth_basic_password = None
