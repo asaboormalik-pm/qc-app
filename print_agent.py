@@ -896,6 +896,7 @@ class ConnectorManager:
         self.workstation_id = self.store.get_workstation_id()
         self.state = self.store.load_state()
         self.stop_event = stop_event or threading.Event()
+        self.consecutive_network_failures = 0
 
     def pair_with_code(self, pairing_code: str, station_name: str = None) -> Dict[str, Any]:
         """Redeem pairing code and receive initial config from backend.
@@ -1056,11 +1057,33 @@ class ConnectorManager:
         """Background thread sending heartbeat every 30 seconds."""
         while not self.stop_event.is_set():
             heartbeat_status = self.send_heartbeat("online")
+
+            # Handle unpaired/revoked states
             if heartbeat_status in {"unpaired", "revoked"}:
                 self.handle_remote_disconnect(
                     "device_unpaired_by_admin" if heartbeat_status == "unpaired" else "device_registration_revoked"
                 )
                 return
+
+            # Handle successful heartbeat - reset network failure counter
+            if heartbeat_status == "connected":
+                self.consecutive_network_failures = 0
+                # If we were in network_unavailable state, recover
+                if self.state.get("connection_status") == "network_unavailable":
+                    logging.info("[NETWORK] Connection restored - resuming operations")
+                    self.store.set_connection_status("paired_active")
+            elif heartbeat_status == "transient":
+                self.consecutive_network_failures += 1
+                logging.warning(f"[NETWORK] Consecutive network failures: {self.consecutive_network_failures}")
+
+                # After 2 consecutive transient errors, verify network connectivity
+                if self.consecutive_network_failures >= 2:
+                    if not self.test_network_connectivity():
+                        logging.error("[NETWORK] Network unavailable - pausing operations")
+                        self.store.set_connection_status("network_unavailable")
+                        # Stop the heartbeat loop - operations paused
+                        return
+
             for _ in range(300):
                 if self.stop_event.is_set():
                     return
@@ -1155,6 +1178,31 @@ class ConnectorManager:
         except Exception as e:
             logging.warning(f"[CONNECTOR] Registration check error: {e}")
             return "transient"
+
+    def test_network_connectivity(self) -> bool:
+        """Test if warehouse network (Supabase edge function) is reachable.
+
+        Returns True if reachable, False if network is down.
+        """
+        try:
+            # Quick test: try to reach the edge function config endpoint
+            # This is a lightweight check that doesn't require control-plane token
+            response = requests.get(
+                f"{self.api_base}?action=config&workstation_id={self.workstation_id}",
+                headers={"X-API-Key": self.shared_api_key},
+                timeout=5
+            )
+            # Any response (even 4xx/5xx) means network is reachable
+            return True
+        except requests.ConnectionError:
+            logging.warning("[NETWORK] Cannot reach edge function - connection error")
+            return False
+        except requests.Timeout:
+            logging.warning("[NETWORK] Cannot reach edge function - timeout")
+            return False
+        except Exception as e:
+            logging.warning(f"[NETWORK] Connectivity test failed: {e}")
+            return False
 
     def _store_secrets(self, config: Dict[str, Any]) -> None:
         """Extract and store secrets from config to keychain."""
@@ -1306,6 +1354,130 @@ class SetupWizard:
         return self.paired_successfully
 
 
+class NetworkErrorWizard:
+    """Wizard shown when network connection is unavailable."""
+
+    def __init__(self, on_retry: Any, on_close: Any):
+        if not TKINTER_AVAILABLE:
+            return
+
+        try:
+            self.root = tk.Tk()
+        except Exception:
+            return
+
+        self.on_retry = on_retry
+        self.on_close = on_close
+        self.root.title("Network Connection Error")
+        self.root.geometry("450x300")
+        self.root.resizable(False, False)
+        self.root.attributes("-topmost", True)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.configure(bg="#f0f0f0")
+
+        self.create_widgets()
+
+        # Center on screen
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width - 450) // 2
+        y = (screen_height - 300) // 2
+        self.root.geometry(f"450x300+{x}+{y}")
+
+        # Bring to front
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after_idle(self.root.attributes, "-topmost", False)
+        self.root.focus_force()
+
+    def create_widgets(self):
+        # Header with icon
+        header_frame = tk.Frame(self.root, bg="#d32f2f", pady=20)
+        header_frame.pack(fill=tk.X)
+
+        # Warning icon (text representation)
+        tk.Label(
+            header_frame,
+            text="⚠",
+            font=("Arial", 36),
+            bg="#d32f2f",
+            fg="white"
+        ).pack()
+
+        tk.Label(
+            header_frame,
+            text="Network Connection Stopped",
+            font=("Helvetica", 16, "bold"),
+            bg="#d32f2f",
+            fg="white"
+        ).pack(pady=(10, 0))
+
+        # Content frame
+        content = tk.Frame(self.root, bg="#f0f0f0", padx=30, pady=30)
+        content.pack(fill=tk.BOTH, expand=True)
+
+        # Message
+        tk.Label(
+            content,
+            text="The print agent cannot reach the warehouse network.",
+            font=("Helvetica", 11),
+            bg="#f0f0f0",
+            wraplength=380
+        ).pack(pady=(0, 10))
+
+        tk.Label(
+            content,
+            text="Please check your network connection and try again.",
+            font=("Helvetica", 11),
+            bg="#f0f0f0",
+            wraplength=380,
+            fg="#666"
+        ).pack(pady=(0, 20))
+
+        # Buttons
+        button_frame = tk.Frame(content, bg="#f0f0f0")
+        button_frame.pack(pady=10)
+
+        tk.Button(
+            button_frame,
+            text="Retry Connection",
+            command=self.on_retry,
+            width=15,
+            height=2,
+            bg="#2196F3",
+            fg="white",
+            font=("Helvetica", 10, "bold"),
+            relief=tk.FLAT,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(
+            button_frame,
+            text="Close",
+            command=self.on_close,
+            width=15,
+            height=2,
+            font=("Helvetica", 10),
+            relief=tk.FLAT,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=5)
+
+    def run(self):
+        """Run the wizard modal loop."""
+        try:
+            self.root.mainloop()
+        except Exception:
+            pass
+
+    def close(self):
+        """Close the wizard."""
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
 class ConnectionStatusWidget:
     """Small floating status widget for the packaged connector."""
 
@@ -1326,6 +1498,8 @@ class ConnectionStatusWidget:
         self.on_pair_again = on_pair_again
         self.on_remote_disconnect = on_remote_disconnect
         self.action_in_progress = False
+        self.network_wizard_shown = False  # Track if network wizard is shown
+        self.network_wizard = None
 
         self.root = tk.Tk()
         self.root.title("QC Connector")
@@ -1353,6 +1527,7 @@ class ConnectionStatusWidget:
             "paired_active": "Connected",
             "server_unpaired": "Disconnected",
             "not_paired": "Reconnecting",
+            "network_unavailable": "Network Error - Paused",
         }
         status_text = status_map.get(connection_status, connection_status.replace("_", " ").title())
         timer_text = _format_connected_duration(state.get("paired_at"), now=now)
@@ -1413,10 +1588,19 @@ class ConnectionStatusWidget:
         self.timer_label.configure(text=display_state["timer"])
 
         if not self.action_in_progress:
-            if state.get("connection_status") == "server_unpaired":
+            conn_status = state.get("connection_status")
+            if conn_status == "server_unpaired":
                 self.message_label.configure(text="Connection removed. Re-pair to continue.")
+                self.network_wizard_shown = False  # Reset flag when status changes
+            elif conn_status == "network_unavailable":
+                self.message_label.configure(text="Network unavailable. Check connection and restart.", foreground="red")
+                # Show network error wizard if not already shown
+                if not self.network_wizard_shown:
+                    self.network_wizard_shown = True
+                    self._show_network_wizard()
             else:
                 self.message_label.configure(text="")
+                self.network_wizard_shown = False  # Reset flag when connection is back
 
         if REMOTE_UNPAIRED_EVENT.is_set() and not self.action_in_progress:
             self._set_action_state(True, "Connection removed. Opening setup...")
@@ -1430,6 +1614,74 @@ class ConnectionStatusWidget:
             return
         self._set_action_state(True, "Reconnecting to warehouse...")
         self.root.after(50, self.on_pair_again)
+
+    def _show_network_wizard(self) -> None:
+        """Show the network error wizard dialog."""
+        try:
+            self.network_wizard = NetworkErrorWizard(
+                on_retry=self._on_network_retry,
+                on_close=self._on_network_wizard_close
+            )
+            # Run wizard in a non-blocking way
+            self.root.after(100, self._run_network_wizard)
+        except Exception as e:
+            logging.error(f"Failed to show network wizard: {e}")
+
+    def _run_network_wizard(self) -> None:
+        """Run the network wizard (called after delay to avoid blocking)."""
+        if self.network_wizard:
+            self.network_wizard.run()
+
+    def _on_network_retry(self) -> None:
+        """Handle retry button click in network wizard."""
+        # Close the wizard
+        if self.network_wizard:
+            self.network_wizard.close()
+            self.network_wizard = None
+
+        # Test network connectivity
+        try:
+            # Try to reach the edge function
+            state = self.store.load_state()
+            api_base = os.getenv("PRINT_AGENT_CALLBACK_URL", "")
+            if not api_base:
+                self.message_label.configure(text="No API URL configured.", foreground="red")
+                return
+
+            # Simple connectivity test
+            response = requests.get(
+                f"{api_base}?action=config&workstation_id={state.get('workstation_id', '')}",
+                headers={"X-API-Key": os.getenv("PRINT_AGENT_API_KEY", "")},
+                timeout=5
+            )
+
+            # If we got any response, network is back
+            if response.status_code in (200, 401, 404):
+                # Network is back - reset status and restart
+                self.store.set_connection_status("paired_active")
+                self.message_label.configure(text="Network restored! Restarting...", foreground="green")
+                self.network_wizard_shown = False
+
+                # Trigger restart after a short delay
+                self.root.after(2000, self._trigger_restart)
+            else:
+                # Still having issues
+                self._show_network_wizard()
+        except Exception:
+            # Network still not available
+            self._show_network_wizard()
+
+    def _on_network_wizard_close(self) -> None:
+        """Handle close button click in network wizard."""
+        if self.network_wizard:
+            self.network_wizard.close()
+            self.network_wizard = None
+
+    def _trigger_restart(self) -> None:
+        """Trigger agent restart to resume normal operation."""
+        logging.info("[NETWORK] Network restored - triggering restart")
+        self.close()
+        # The main process will detect the closed window and handle restart
 
     def on_minimize(self) -> None:
         self.root.iconify()
@@ -2240,6 +2492,11 @@ class PrintAgent:
 
     def _fetch_pending_jobs(self) -> List[Dict[str, Any]]:
         """Fetch multiple pending jobs up to max_concurrent_jobs limit."""
+        # Skip polling if network is unavailable
+        if LocalConfigStore().load_state().get("connection_status") == "network_unavailable":
+            logging.debug("[PRINT] Skipping poll - network unavailable")
+            return []
+
         limit = self.config.max_concurrent_jobs
         try:
             response = requests.get(

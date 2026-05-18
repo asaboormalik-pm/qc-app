@@ -90,7 +90,7 @@ jobs:
               "ERP_AGENT_MAX_CONCURRENT_REQUESTS=2"
               "LOG_FILE=print_agent.log"
               "WORKSTATION_ID="
-              "STALE_JOB_TIMEOUT_SECONDS=300"
+              "STALE_JOB_TIMEOUT_SECONDS=120"
             ) | Set-Content -Path dist\qc-print-agent\.env.example -Encoding utf8
           } else {
             Copy-Item .env.example dist\qc-print-agent\.env.example -Force
@@ -201,7 +201,7 @@ jobs:
               printf '%s\n' "ERP_AGENT_MAX_CONCURRENT_REQUESTS=2"
               printf '%s\n' "LOG_FILE=print_agent.log"
               printf '%s\n' "WORKSTATION_ID="
-              printf '%s\n' "STALE_JOB_TIMEOUT_SECONDS=300"
+              printf '%s\n' "STALE_JOB_TIMEOUT_SECONDS=120"
             } > "dist/QC Print Agent.app/Contents/MacOS/.env.example"
           else
             cp .env.example "dist/QC Print Agent.app/Contents/MacOS/.env.example"
