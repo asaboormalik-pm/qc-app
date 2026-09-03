@@ -1,6 +1,7 @@
-# Environment variables
+# Environment variables (keep only the public template tracked)
 .env
-.env.local
+.env.*
+!.env.example
 
 # Python
 .venv/
@@ -11,3 +12,8 @@ __pycache__/
 print_agent.pid
 print_agent.log
 *.log
+
+# Local build and test output
+.pytest_cache/
+htmlcov/
+.coverage

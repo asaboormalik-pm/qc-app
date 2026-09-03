@@ -15,7 +15,7 @@ import requests
 
 
 ENV_PATH = Path(__file__).with_name(".env")
-DEFAULT_ENDPOINT_URL = "http://192.168.16.201/ka_shlyapnikova/hs/BMJERP/event-completion/POST"
+DEFAULT_ENDPOINT_URL = ""
 
 
 def load_env_file(path: Path) -> None:
@@ -173,6 +173,10 @@ def test_completion_event(
     erp_url = url_override or erp_url
     timeout_seconds = timeout_override or timeout_seconds
 
+    if not erp_url:
+        print("ERROR: Configure ERP_ENDPOINTS_JSON.completion_event.url or pass --url.")
+        return False
+
     erp_username = os.getenv("ERP_AUTH_BASIC_USERNAME", "").strip()
     erp_password = os.getenv("ERP_AUTH_BASIC_PASSWORD", "").strip()
     test_payload = build_test_payload()
@@ -255,8 +259,7 @@ def test_completion_event(
 
     except requests.ConnectionError as exc:
         print(f"\n[ERROR] CONNECTION ERROR: {exc}")
-        print("Check if the ERP server is reachable:")
-        print("  ping 192.168.16.201")
+        print("Check whether the configured ERP host is reachable:")
         print(f"  curl -v {erp_url}")
         return False
     except requests.Timeout as exc:

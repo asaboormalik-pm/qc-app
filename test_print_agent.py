@@ -64,7 +64,7 @@ class PrintAgentProcessJobTests(unittest.TestCase):
     def test_process_job_printer_success_path_is_unchanged(self) -> None:
         job = {
             "id": "job-print-1",
-            "printer_ip": "192.168.0.10",
+            "printer_ip": "203.0.113.10",
             "printer_port": 9100,
             "zpl_data": "^XA^XZ",
         }

@@ -3013,8 +3013,6 @@ def _load_env_file(path: Path) -> None:
             )
             os.environ[cleaned_key] = cleaned_value
 
-# https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent
-
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:

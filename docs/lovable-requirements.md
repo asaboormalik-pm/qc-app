@@ -171,6 +171,6 @@ After Lovable implements these changes, test:
 
 | File | Purpose |
 |------|---------|
-| [README.md](../../../README.md) - Agent overview |
-| [SMOKE_TEST.md](../../../SMOKE_TEST.md) - Expected edge function contract |
-| [.env.example](../../../.env.example) - Configuration template |
+| [README.md](../README.md) - Agent overview |
+| [SMOKE_TEST.md](../SMOKE_TEST.md) - Expected edge function contract |
+| [.env.example](../.env.example) - Configuration template |

@@ -4,9 +4,24 @@
 import socket
 import sys
 import os
+from urllib.parse import urlparse
+
+
+def _configured_host_and_port(url):
+    """Return a connectable host and port without embedding deployment addresses."""
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return None
+    return parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
 
 def test_network_connectivity():
     """Test basic network connectivity."""
+    try:
+        from print_agent import load_dotenv
+        load_dotenv()
+    except Exception as exc:
+        print(f"[WARN] Could not load local .env for endpoint diagnostics: {exc}")
+
     print("=" * 60)
     print("NETWORK CONNECTIVITY DIAGNOSTIC")
     print("=" * 60)
@@ -21,33 +36,40 @@ def test_network_connectivity():
         print(f"[ERROR] Socket creation failed: {e}")
         return False
 
-    # Test 2: Supabase connection
-    print("\n[Test 2] Supabase Edge Function")
-    try:
-        import requests
-        url = "https://wktfsmiclvyhjpkibgis.supabase.co/functions/v1/print-agent"
-        print(f"[INFO] Testing connection to: {url}")
-        response = requests.get(url, timeout=5)
-        print(f"[OK] Supabase reachable (status {response.status_code})")
-    except Exception as e:
-        print(f"[ERROR] Supabase connection failed: {e}")
+    # Test 2: configured control-plane connection
+    print("\n[Test 2] Configured Print Agent Endpoint")
+    callback_url = os.getenv("PRINT_AGENT_CALLBACK_URL", "").strip()
+    if callback_url:
+        try:
+            import requests
+            print(f"[INFO] Testing configured host: {urlparse(callback_url).hostname}")
+            response = requests.get(callback_url, timeout=5)
+            print(f"[OK] Endpoint reachable (status {response.status_code})")
+        except Exception as e:
+            print(f"[ERROR] Print agent endpoint connection failed: {e}")
+    else:
+        print("[SKIP] PRINT_AGENT_CALLBACK_URL is not configured")
 
-    # Test 3: ERP endpoint
-    print("\n[Test 3] ERP Endpoint (192.168.16.201:80)")
-    try:
-        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        test_socket.settimeout(3)
-        test_socket.connect(('192.168.16.201', 80))
-        print("[OK] Connected to ERP endpoint")
-        test_socket.close()
-    except socket.timeout:
-        print("[TIMEOUT] Connection timed out")
-    except ConnectionRefusedError:
-        print("[REFUSED] Connection refused")
-    except PermissionError as e:
-        print(f"[PERMISSION] Permission denied: {e}")
-    except Exception as e:
-        print(f"[ERROR] {e}")
+    # Test 3: configured ERP-agent endpoint
+    print("\n[Test 3] Configured ERP Agent Endpoint")
+    erp_agent_target = _configured_host_and_port(os.getenv("ERP_AGENT_URL", "").strip())
+    if erp_agent_target:
+        try:
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.settimeout(3)
+            test_socket.connect(erp_agent_target)
+            print(f"[OK] Connected to ERP agent host: {erp_agent_target[0]}:{erp_agent_target[1]}")
+            test_socket.close()
+        except socket.timeout:
+            print("[TIMEOUT] Connection timed out")
+        except ConnectionRefusedError:
+            print("[REFUSED] Connection refused")
+        except PermissionError as e:
+            print(f"[PERMISSION] Permission denied: {e}")
+        except Exception as e:
+            print(f"[ERROR] {e}")
+    else:
+        print("[SKIP] ERP_AGENT_URL is not configured")
 
     # Test 4: Local ports
     print("\n[Test 4] Common Local Ports")
