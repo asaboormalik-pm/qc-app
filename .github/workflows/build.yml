@@ -1,0 +1,154 @@
+name: Build Connector Installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+      - Installer-Implementation
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          # Remove dist folder to avoid "not empty" error
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          python -m PyInstaller print_agent.spec
+
+      - name: Verify bundled Tcl/Tk files
+        run: |
+          echo "=== Checking dist folder structure ==="
+          dir dist\qc-print-agent
+          echo ""
+          echo "=== Checking for _internal folder ==="
+          dir dist\qc-print-agent\_internal | Select-Object -First 20
+          echo ""
+          echo "=== Checking for Tcl/Tk data folders ==="
+          dir dist\qc-print-agent\_internal\_tcl_data 2>nul || echo "No _tcl_data folder"
+          dir dist\qc-print-agent\_internal\_tk_data 2>nul || echo "No _tk_data folder"
+          echo ""
+          echo "=== Checking for Tcl/Tk DLLs ==="
+          dir dist\qc-print-agent\_internal\tcl*.dll 2>nul || echo "No tcl DLLs"
+          dir dist\qc-print-agent\_internal\tk*.dll 2>nul || echo "No tk DLLs"
+          echo ""
+          echo "=== Build complete ==="
+
+      - name: Include placeholder configuration template
+        run: Copy-Item .env.example dist\qc-print-agent\.env.example -Force
+
+      - name: Set archive name
+        id: windows_archive
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $version = $env:GITHUB_REF_NAME
+          } else {
+            $version = "$($env:GITHUB_REF_NAME)-build-$($env:GITHUB_RUN_NUMBER)"
+          }
+          "archive_name=qc-print-agent-windows-$version.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Create ZIP archive
+        run: |
+          cd dist
+          Compress-Archive -Path qc-print-agent -DestinationPath "${{ steps.windows_archive.outputs.archive_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.windows_archive.outputs.archive_name }}
+          path: dist/${{ steps.windows_archive.outputs.archive_name }}
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/${{ steps.windows_archive.outputs.archive_name }}
+          generate_release_notes: true
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          # Remove dist folder to avoid "not empty" error
+          rm -rf dist
+          python3 -m PyInstaller print_agent.spec
+
+      - name: Verify bundled Tcl/Tk files
+        run: |
+          echo "=== Checking dist folder structure ==="
+          ls -la dist/
+          echo ""
+          echo "=== Checking app bundle ==="
+          ls -la "dist/QC Print Agent.app/Contents/MacOS"
+          echo ""
+          echo "=== Checking for _internal folder ==="
+          ls -la "dist/QC Print Agent.app/Contents/MacOS/_internal/" | head -20
+          echo ""
+          echo "=== Checking for Tcl/Tk data folders ==="
+          ls "dist/QC Print Agent.app/Contents/MacOS/_internal/_tcl_data" 2>/dev/null || echo "No _tcl_data folder"
+          ls "dist/QC Print Agent.app/Contents/MacOS/_internal/_tk_data" 2>/dev/null || echo "No _tk_data folder"
+          echo ""
+          echo "=== Build complete ==="
+
+      - name: Include placeholder configuration template
+        run: cp .env.example "dist/QC Print Agent.app/Contents/MacOS/.env.example"
+
+      - name: Set archive name
+        id: macos_archive
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION="${GITHUB_REF_NAME}-build-${GITHUB_RUN_NUMBER}"
+          fi
+          echo "archive_name=qc-print-agent-macos-${VERSION}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Create ZIP archive
+        run: |
+          cd dist
+          tar -czf "${{ steps.macos_archive.outputs.archive_name }}" "QC Print Agent.app"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.macos_archive.outputs.archive_name }}
+          path: dist/${{ steps.macos_archive.outputs.archive_name }}
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/${{ steps.macos_archive.outputs.archive_name }}
+          generate_release_notes: true
